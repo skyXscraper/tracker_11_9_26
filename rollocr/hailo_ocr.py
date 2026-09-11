@@ -53,50 +53,73 @@ def split_text_lines(crop: np.ndarray, cfg_detect, max_lines: int = 3) -> list[t
     if mask is None or not mask.any():
         return []
 
-    height, width = mask.shape[:2]
-    # Join strokes within a line before projecting.
-    kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (max(3, width // 10), 3))
-    mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, kernel)
-
-    rows = (mask > 0).sum(axis=1).astype(np.float32)
-    window = max(3, height // 30)
-    rows = np.convolve(rows, np.ones(window, dtype=np.float32) / window, mode="same")
-    if rows.max() <= 0:
+    # Group the individual strokes, rather than thresholding a row profile.
+    # A row profile cannot tell "two lines close together" from "one tall
+    # line", and the two written lines here sit only a few pixels apart -- any
+    # tolerance loose enough to join a lifted pen also welds ply to lengths,
+    # which hands a single-line recogniser a two-line image and it returns
+    # nothing at all.
+    count, _, stats, centroids = cv2.connectedComponentsWithStats(mask, 8)
+    strokes = []
+    for i in range(1, count):
+        x, y, w, h, area = stats[i]
+        if area < 20 or h < 5:
+            continue
+        strokes.append({"x0": int(x), "x1": int(x + w - 1),
+                        "top": int(y), "bottom": int(y + h - 1),
+                        "height": int(h), "area": int(area),
+                        "cy": float(centroids[i][1])})
+    if not strokes:
         return []
 
-    active = rows >= max(1.0, rows.max() * 0.15)
-    bands: list[list[int]] = []
-    start = None
-    for y, on in enumerate(active):
-        if on and start is None:
-            start = y
-        elif not on and start is not None:
-            bands.append([start, y - 1])
-            start = None
-    if start is not None:
-        bands.append([start, height - 1])
+    # Size the tolerance from the *digits*, not from every speck. The median is
+    # dragged down by punctuation and noise -- on a real crop it gave 9 px
+    # against a 30 px digit, which split "99" in half. The upper quartile
+    # tracks the character height that actually matters.
+    typical = float(np.percentile([s["height"] for s in strokes], 75))
+    tolerance = max(6.0, typical * 0.9)
+
+    strokes.sort(key=lambda s: s["cy"])
+    groups: list[list[dict]] = [[strokes[0]]]
+    for stroke in strokes[1:]:
+        if stroke["cy"] - groups[-1][-1]["cy"] <= tolerance:
+            groups[-1].append(stroke)
+        else:
+            groups.append([stroke])
+
+    bands = []
+    for group in groups:
+        # A written line is several glyphs side by side. Strokes stacked on
+        # the same column are one glyph (or one stain), not a line of text.
+        if _distinct_glyphs(group) < 2:
+            continue
+        top = min(s["top"] for s in group)
+        bottom = max(s["bottom"] for s in group)
+        if (bottom - top) < 5:
+            continue
+        bands.append({"top": top, "bottom": bottom,
+                      "ink": sum(s["area"] for s in group)})
     if not bands:
         return []
 
-    # Merge fragments of the same line: a gap smaller than half a typical line
-    # height is a lifted pen, not a new line.
-    typical = float(np.median([b[1] - b[0] + 1 for b in bands]))
-    tolerance = max(3.0, typical * 0.5)
-    merged = [bands[0]]
-    for top, bottom in bands[1:]:
-        if top - merged[-1][1] <= tolerance:
-            merged[-1][1] = bottom
+    strongest = max(b["ink"] for b in bands)
+    kept = [b for b in bands if b["ink"] >= strongest * 0.15]
+    kept.sort(key=lambda b: -b["ink"])
+    return sorted((b["top"], b["bottom"]) for b in kept[:max_lines])
+
+
+def _distinct_glyphs(group: list[dict]) -> int:
+    """How many separate characters a group of strokes spans horizontally."""
+    spans = sorted((s["x0"], s["x1"]) for s in group)
+    glyphs = 0
+    reach = -1
+    for x0, x1 in spans:
+        if x0 > reach:
+            glyphs += 1
+            reach = x1
         else:
-            merged.append([top, bottom])
-
-    # Drop faint scraps -- partial markings clipped in from a neighbouring roll.
-    mass = [(mask[t:b + 1] > 0).sum() for t, b in merged]
-    strongest = max(mass) if mass else 0
-    kept = [(t, b) for (t, b), m in zip(merged, mass)
-            if m >= strongest * 0.15 and (b - t) >= 4]
-
-    kept.sort(key=lambda band: -(mask[band[0]:band[1] + 1] > 0).sum())
-    return sorted(kept[:max_lines])
+            reach = max(reach, x1)
+    return glyphs
 
 
 def preprocess_line(line: np.ndarray) -> np.ndarray:
@@ -200,18 +223,35 @@ class HailoRecognizer:
         if crop is None or crop.size == 0 or not self._ready:
             return []
 
-        bands = split_text_lines(crop, self.cfg_detect)
+        # Imported here rather than at module scope: ocr.py loads this module
+        # lazily, and importing it back at load time would be circular.
+        from .ocr import deskew_angle, rotate, soft_ink
+
+        work = crop
+        if self.cfg.deskew:
+            work = rotate(crop, deskew_angle(crop, self.cfg_detect))
+
+        # Line bands must come from the colour image -- the ink mask keys on
+        # the red hue, which enhancement deliberately flattens away.
+        bands = split_text_lines(work, self.cfg_detect)
         if not bands:
-            bands = [(0, crop.shape[0] - 1)]
+            bands = [(0, work.shape[0] - 1)]
+
+        # The recogniser was trained on printed text: dark glyphs on a light
+        # ground. Red pen on a glossy wrap is neither, and feeding it raw is
+        # why the network returned blank for every timestep. Darkening the
+        # strokes in proportion to their redness is the same enhancement the
+        # CPU path uses, and it is what makes the crop legible to the model.
+        source = soft_ink(work) if self.cfg.hailo_enhance else work
 
         prepared, centres = [], []
         for top, bottom in bands:
             pad = max(2, int((bottom - top) * 0.2))
             y0 = max(0, top - pad)
-            y1 = min(crop.shape[0], bottom + pad + 1)
+            y1 = min(source.shape[0], bottom + pad + 1)
             if y1 - y0 < 4:
                 continue
-            prepared.append(preprocess_line(crop[y0:y1]))
+            prepared.append(preprocess_line(source[y0:y1]))
             centres.append((y0 + y1) / 2.0)
 
         if not prepared:

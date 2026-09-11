@@ -35,14 +35,24 @@ def load(name: str):
 # -- splitting the two written lines ----------------------------------------
 
 def test_two_line_crop_splits_into_exactly_two_lines():
-    """Regression: sparse handwriting fragmented this crop into five bands,
-    because a raw row projection breaks wherever the pen lifted."""
+    """Regression: this crop first fragmented into five bands, then welded both
+    written lines into one -- and a single-line recogniser fed two lines returns
+    blank for every timestep.
+
+    The bands are ordered but NOT disjoint. The writing sits on a slanted,
+    curved cylinder, so the ply line's lowest stroke (y=130) hangs below the
+    length line's highest (y=123). Splitting is by stroke grouping rather than
+    by a row profile precisely because no horizontal cut separates them.
+    """
     bands = split_text_lines(load("roll_ply99.jpg"), CFG.detect)
     assert len(bands) == 2, f"expected ply line + length line, got {bands}"
 
     (top_a, bottom_a), (top_b, bottom_b) = bands
-    assert bottom_a < top_b, "bands must be disjoint and ordered top to bottom"
+    assert top_a < top_b, "bands must run top to bottom"
     assert (bottom_a - top_a) >= 8 and (bottom_b - top_b) >= 8
+    # The lengths line is the one that identifies the roll; it must come
+    # through as its own band rather than merged with the ply above it.
+    assert top_b >= 100 and bottom_b >= 160
 
 
 def test_clipped_crop_yields_a_single_line():

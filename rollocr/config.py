@@ -80,6 +80,10 @@ class OcrConfig:
     hailo_rec_hef: str = "~/hailo_models/paddle_ocr_v5_mobile_recognition.hef"
     hailo_charset: str = "~/hailo_models/ppocrv5_dict.txt"
     hailo_fallback: bool = True
+    # The NPU recogniser is trained on printed text, so red pen on a glossy
+    # wrap must be contrast-boosted the same way the CPU path boosts it.
+    # Without this the network returns blank for every timestep.
+    hailo_enhance: bool = True
     num_threads: int = 2             # leave cores for capture on the Pi's 4
     target_text_height: int = 80     # measured better than 48 on this footage
     max_side: int = 960              # cap the crop we hand to detection
