@@ -258,6 +258,26 @@ source .venv/bin/activate          # Windows: .venv\Scripts\activate
 pip install -r requirements.txt
 ```
 
+### On the Pi, the venv must see the system packages
+
+`sudo apt install hailo-all` installs `hailo_platform` into the *system* Python
+(`/usr/lib/python3/dist-packages`), which a plain `python -m venv` cannot see.
+Because the Hailo backend falls back to the CPU when that import fails, an
+isolated venv leaves the pipeline running on the CPU while appearing to use the
+NPU. Create it so it can see them:
+
+```bash
+sudo apt install -y python3-opencv python3-numpy
+python -m venv --system-site-packages venv
+source venv/bin/activate
+python -c "import hailo_platform, cv2, numpy; print('ok')"
+```
+
+Raspberry Pi OS Trixie ships **Python 3.13**, where `rapidocr-onnxruntime` will
+not install at all — only the newer `rapidocr` package supports it, and
+`requirements.txt` selects between them with an environment marker. Running the
+NPU backend needs neither: the system OpenCV and NumPy are enough.
+
 `data/master_list.csv` needs the columns `ply_no, start, end, length_m,
 no_of_ply, item_number, item_description, packing_list`. Ply numbers and
 `(start, end)` pairs are both unique in the supplied file, and `end - start`
