@@ -9,7 +9,7 @@ the cameras that will be deployed.
 ```
 python run.py --cam1 videos/cam0_test1.mp4 --cam2 videos/cam2_test1.mp4   # offline
 python run.py --cam1 /dev/video0 --cam2 /dev/video2 --no-display          # on the Pi
-python -m pytest tests/ -q                                                # 46 tests
+python -m pytest tests/ -q                                                # 62 tests
 ```
 
 ---
@@ -132,6 +132,7 @@ data-collection task, not a code change.
 | `identity.py` | one global ID per roll, across both cameras |
 | `pipeline.py` | when it is worth spending an OCR call |
 | `logio.py` | JSONL audit trail + CSV summary, both UTF-8 |
+| `hailo_ocr.py` | optional PP-OCRv5 recognition on a Hailo NPU |
 
 ### Identity across the two cameras
 
@@ -181,6 +182,71 @@ Measure the real numbers on the hardware:
 ```bash
 python tools/bench_ocr.py --video videos/cam0_test2.mp4 --frames 150
 ```
+
+---
+
+## Optional: PP-OCRv5 recognition on a Hailo NPU
+
+The Pi AI Kit carries a **Hailo-8L**, and the Hailo Model Zoo publishes
+pre-compiled PaddleOCR-v5 HEFs for that architecture. Setting
+`ocr.backend = "hailo"` runs recognition on the NPU instead of the CPU.
+
+```bash
+mkdir -p ~/hailo_models && cd ~/hailo_models
+wget https://hailo-model-zoo.s3.eu-west-2.amazonaws.com/ModelZoo/Compiled/v2.19.0/hailo8l/paddle_ocr_v5_mobile_recognition.hef
+wget -O ppocrv5_dict.txt https://raw.githubusercontent.com/PaddlePaddle/PaddleOCR/main/ppocr/utils/dict/ppocrv5_dict.txt
+
+cd ~/tracker_11_9_26
+python tools/test_hailo.py --image tests/fixtures/roll_ply99.jpg
+```
+
+`tools/test_hailo.py` runs the NPU and the CPU over the same crop and prints
+both readings with timings. The fixtures carry known ground truth
+(`roll_ply99.jpg` is ply 99, 4.7-17.5), so a correct result is recognisable
+without a camera. Only switch the pipeline over once that looks right:
+
+```bash
+python run.py --cam1 /dev/video0 --cam2 /dev/video2 \
+  --config config.pi.json --no-display   # add "ocr": {"backend": "hailo"} to the config
+```
+
+If the device or `hailo_platform` is missing the backend logs a warning and
+falls back to the CPU path, so the same tree still runs on a laptop.
+
+### What the compiled model forces
+
+The HEF reports `input 48x320x3 UINT8` and `output 1x40x18385`, and three
+consequences follow:
+
+* **Fixed 48x320 input.** Lines are resized to 48 tall keeping aspect and
+  padded to 320 wide. The pad value is **128, not 0** — PP-OCR normalises
+  `(x/255 - 0.5)/0.5` inside the HEF, so the trained model's "zero padding" is
+  mid-grey going in. Padding black feeds it a bar it never saw in training.
+* **Softmax is already applied on-device**, over 40 CTC timesteps and 18385
+  classes, so the host only does a greedy collapse against `ppocrv5_dict.txt`.
+* **It recognises one line at a time.** A roll carries two, so the crop is
+  split on the ink mask's horizontal projection first. That is far cheaper than
+  running the 544x960 detection HEF to locate lines the colour detector has
+  already found, and it preserves each line's vertical position — which is what
+  tells ply from lengths in `parse.py`.
+
+Handwriting is sparse, so a raw row projection breaks a single line into
+fragments wherever the pen lifted; the mask is closed horizontally, the
+projection smoothed, and bands closer together than half a line height merged.
+`tests/test_hailo_ocr.py` pins that at two bands for a two-line crop.
+
+### What to expect from it
+
+Speed, and possibly a little accuracy. The NPU removes the ~200 ms CPU
+recognition cost, which lets you relax the per-track OCR throttle and read a
+roll on many more of the frames it is visible for — more votes, steadier
+results. And because this is PP-OCR**v5** against the v4 weights RapidOCR ships,
+the misreads in finding 3 may improve.
+
+They may equally not. Run `tools/test_hailo.py` on `roll_ply99.jpg` and look at
+what comes back: if v5 still reads `17.5` as `135`, the conclusion in finding 3
+stands and no amount of hardware changes it — the fix is a recogniser fine-tuned
+on this plant's handwriting.
 
 ---
 

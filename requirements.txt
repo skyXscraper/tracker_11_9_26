@@ -12,3 +12,7 @@ numpy>=1.24.0
 
 # Tests only.
 pytest>=7.4.0
+
+# The Hailo runtime (hailo_platform) is installed system-wide by
+# "sudo apt install hailo-all" on Raspberry Pi OS, not from PyPI. It is only
+# needed when ocr.backend is "hailo"; the CPU path has no such dependency.

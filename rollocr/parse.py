@@ -74,7 +74,8 @@ def parse_ply(text: str, cfg) -> str | None:
     return cleaned
 
 
-def _valid_value(text: str, cfg) -> bool:
+def _well_formed(text: str, cfg) -> bool:
+    """Structurally a number: one decimal point at most, parseable."""
     if text.count(".") > 1 or not text or text in ".":
         return False
     if text.startswith(".") or text.endswith("."):
@@ -82,10 +83,29 @@ def _valid_value(text: str, cfg) -> bool:
     if "." in text and len(text.split(".")[1]) > cfg.max_decimals:
         return False
     try:
+        float(text)
+    except ValueError:
+        return False
+    return True
+
+
+def in_range(text: str, cfg) -> bool:
+    """Inside the plant's plausible span. A ranking signal, not a gate.
+
+    OCR drops faint decimal points, so a true 17.5 arrives as "175" or "135".
+    Rejecting those outright reported nothing at all for the roll; ranking them
+    last keeps the digits available, and the master-list match can still
+    identify the roll from them.
+    """
+    try:
         value = float(text)
     except ValueError:
         return False
     return cfg.value_min <= value < cfg.value_max
+
+
+def _valid_value(text: str, cfg) -> bool:
+    return _well_formed(text, cfg) and in_range(text, cfg)
 
 
 def _split_groups(groups: list[str], cfg, explicit: bool) -> list[RangeReading]:
@@ -94,7 +114,7 @@ def _split_groups(groups: list[str], cfg, explicit: bool) -> list[RangeReading]:
     for cut in range(len(groups) - 1):
         start = ".".join(groups[: cut + 1])
         end = ".".join(groups[cut + 1:])
-        if not (_valid_value(start, cfg) and _valid_value(end, cfg)):
+        if not (_well_formed(start, cfg) and _well_formed(end, cfg)):
             continue
         readings.append(RangeReading(start, end, explicit))
     return readings
@@ -115,7 +135,7 @@ def parse_range(text: str, cfg) -> list[RangeReading]:
         if sep in cleaned:
             left, _, right = cleaned.partition(sep)
             left, right = left.strip(". "), right.strip(". ")
-            if _valid_value(left, cfg) and _valid_value(right, cfg):
+            if _well_formed(left, cfg) and _well_formed(right, cfg):
                 return [RangeReading(left, right, True)]
             # A misread dash inside one number: fall through to the dot logic.
             cleaned = cleaned.replace(sep, ".")
@@ -133,10 +153,19 @@ def parse_range(text: str, cfg) -> list[RangeReading]:
 
 
 def _rank(cfg):
+    """Best reading first: in range, then correctly ordered, then fractional.
+
+    Every one of these is a preference. A clipped or mis-recognised reading is
+    still the only evidence there is, so it is demoted, never discarded.
+    """
     def key(reading: RangeReading):
+        plausible = in_range(reading.start, cfg) and in_range(reading.end, cfg)
         ordered = float(reading.end) > float(reading.start)
         both_fractional = ("." in reading.start) + ("." in reading.end)
-        return (not (ordered or not cfg.prefer_end_gt_start), -both_fractional, float(reading.end))
+        return (not plausible,
+                not (ordered or not cfg.prefer_end_gt_start),
+                -both_fractional,
+                float(reading.end))
     return key
 
 

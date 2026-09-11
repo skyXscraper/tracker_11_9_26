@@ -72,7 +72,14 @@ class TrackConfig:
 
 @dataclass
 class OcrConfig:
-    backend: str = "rapidocr"        # PP-OCR models on ONNX Runtime
+    # "rapidocr" runs PP-OCRv4 on the CPU via ONNX Runtime and works anywhere.
+    # "hailo" runs PP-OCRv5 recognition on a Hailo NPU; it needs the compiled
+    # HEF and the v5 charset below, and falls back to rapidocr if the device or
+    # the hailo_platform package is missing.
+    backend: str = "rapidocr"
+    hailo_rec_hef: str = "~/hailo_models/paddle_ocr_v5_mobile_recognition.hef"
+    hailo_charset: str = "~/hailo_models/ppocrv5_dict.txt"
+    hailo_fallback: bool = True
     num_threads: int = 2             # leave cores for capture on the Pi's 4
     target_text_height: int = 80     # measured better than 48 on this footage
     max_side: int = 960              # cap the crop we hand to detection

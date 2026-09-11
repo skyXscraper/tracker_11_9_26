@@ -110,7 +110,27 @@ class OcrEngine:
         self.cfg = cfg
         self.cfg_detect = cfg_detect
         self._engine = None
+        self._hailo = None
         self._lock = threading.Lock()
+        if cfg.backend == "hailo":
+            self._hailo = self._try_hailo()
+
+    def _try_hailo(self):
+        """Bring up the NPU recogniser, or fall back to the CPU path.
+
+        A missing accelerator should degrade to a slower system, not a dead
+        one -- the same code has to run on a laptop with no Hailo in it.
+        """
+        from .hailo_ocr import HailoRecognizer
+        try:
+            recognizer = HailoRecognizer(self.cfg, self.cfg_detect)
+            print("[ocr] backend: hailo (PP-OCRv5 recognition on NPU)")
+            return recognizer
+        except Exception as exc:
+            if not self.cfg.hailo_fallback:
+                raise
+            print(f"[ocr] hailo backend unavailable ({exc}); falling back to rapidocr")
+            return None
 
     def _ensure(self):
         if self._engine is None:
@@ -130,6 +150,13 @@ class OcrEngine:
         """Return (text, y-centre, confidence) for each line found in the crop."""
         if crop is None or crop.size == 0:
             return []
+
+        if self._hailo is not None:
+            # The NPU model is a single-line recogniser and does its own line
+            # splitting, so it takes the crop as-is rather than the enhanced,
+            # rescaled image the CPU detector needs.
+            return self._hailo.read(crop)
+
         engine = self._ensure()
 
         prepared = soft_ink(crop)
