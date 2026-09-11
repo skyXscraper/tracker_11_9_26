@@ -1,18 +1,28 @@
-# Roll OCR + tracking. Installs as-is on Raspberry Pi OS (aarch64) and Windows.
+# Roll OCR + tracking.
 #
-# OCR is PP-OCR (PaddleOCR's detection and recognition models) executed on ONNX
-# Runtime rather than the PaddlePaddle runtime. Same models, same accuracy,
-# but the session holds a few hundred MB instead of well over a gigabyte --
-# which is what makes two camera pipelines fit on a 2 GB Pi 5.
-rapidocr-onnxruntime>=1.3.0
-onnxruntime>=1.17.0
-
+# Core. Needed by every backend.
 opencv-python>=4.8.0
 numpy>=1.24.0
+
+# CPU OCR backend: PP-OCR (PaddleOCR's models) executed on ONNX Runtime rather
+# than the PaddlePaddle runtime -- same models, but a few hundred MB resident
+# instead of well over a gigabyte, which is what makes two camera pipelines fit
+# on a 2 GB Pi 5.
+#
+# The package split in two and the halves disagree about Python support:
+# rapidocr-onnxruntime (1.x) caps out below Python 3.13, while its successor
+# rapidocr (3.x) runs on it. Raspberry Pi OS Trixie ships Python 3.13, so the
+# marker below picks whichever one can actually install. rollocr/ocr.py accepts
+# either and normalises their differing result shapes.
+rapidocr-onnxruntime>=1.3.0; python_version < "3.13"
+rapidocr>=3.8.0; python_version >= "3.13"
 
 # Tests only.
 pytest>=7.4.0
 
-# The Hailo runtime (hailo_platform) is installed system-wide by
-# "sudo apt install hailo-all" on Raspberry Pi OS, not from PyPI. It is only
-# needed when ocr.backend is "hailo"; the CPU path has no such dependency.
+# NOT from PyPI: the Hailo runtime (hailo_platform) is installed system-wide by
+# "sudo apt install hailo-all" on Raspberry Pi OS. A venv only sees it when
+# created with --system-site-packages. It is needed solely when ocr.backend is
+# "hailo"; on a Pi running only the NPU backend you can install the core two
+# packages above (or use the system python3-opencv / python3-numpy) and skip
+# the RapidOCR lines entirely.

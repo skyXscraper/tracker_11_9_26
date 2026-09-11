@@ -20,6 +20,7 @@ process for no throughput gain on four cores.
 
 from __future__ import annotations
 
+import os
 import queue
 import threading
 import time
@@ -110,6 +111,7 @@ class OcrEngine:
         self.cfg = cfg
         self.cfg_detect = cfg_detect
         self._engine = None
+        self._flavour = None
         self._hailo = None
         self._lock = threading.Lock()
         if cfg.backend == "hailo":
@@ -133,18 +135,69 @@ class OcrEngine:
             return None
 
     def _ensure(self):
-        if self._engine is None:
+        """Load whichever RapidOCR generation is installed.
+
+        The package split in two and the halves disagree about Python support:
+        ``rapidocr-onnxruntime`` (1.x) caps out below Python 3.13, while its
+        successor ``rapidocr`` (3.x) runs on it. Raspberry Pi OS Trixie ships
+        Python 3.13, so the Pi can only have the newer one -- and the two
+        return results in different shapes. Both are accepted here so the same
+        tree runs on a 3.11 laptop and a 3.13 Pi.
+        """
+        if self._engine is not None:
+            return self._engine
+
+        # ONNX Runtime reads this at session creation; 3.x exposes no thread
+        # argument, so this is the portable way to keep it off every core.
+        os.environ.setdefault("OMP_NUM_THREADS", str(self.cfg.num_threads))
+
+        try:
+            from rapidocr import RapidOCR
+            self._flavour = "rapidocr3"
+            self._engine = RapidOCR()
+        except ImportError:
             try:
                 from rapidocr_onnxruntime import RapidOCR
-            except ImportError as exc:            # pragma: no cover - deployment guard
+            except ImportError as exc:        # pragma: no cover - deployment guard
                 raise RuntimeError(
-                    "rapidocr-onnxruntime is not installed; run: pip install -r requirements.txt"
+                    "No RapidOCR package found. Install one of:\n"
+                    "  pip install rapidocr           # Python 3.8+, needed on 3.13\n"
+                    "  pip install rapidocr-onnxruntime  # Python < 3.13\n"
+                    "Not required when ocr.backend is 'hailo'."
                 ) from exc
+            self._flavour = "rapidocr1"
             self._engine = RapidOCR(
                 intra_op_num_threads=self.cfg.num_threads,
                 inter_op_num_threads=1,
             )
         return self._engine
+
+    def _run(self, image) -> list[tuple[str, float, float]]:
+        """Normalise the two packages' very different return shapes."""
+        engine = self._ensure()
+        with self._lock:
+            raw = engine(image)
+
+        lines: list[tuple[str, float, float]] = []
+        if self._flavour == "rapidocr1":
+            result = raw[0] if isinstance(raw, tuple) else raw
+            for box, text, confidence in result or []:
+                ys = [point[1] for point in box]
+                lines.append((text, float(sum(ys) / len(ys)), float(confidence)))
+            return lines
+
+        # 3.x returns an object with parallel boxes/txts/scores arrays.
+        boxes = getattr(raw, "boxes", None)
+        texts = getattr(raw, "txts", None)
+        scores = getattr(raw, "scores", None)
+        if boxes is None or texts is None:
+            return lines
+        for index, text in enumerate(texts):
+            box = boxes[index]
+            ys = [float(point[1]) for point in box]
+            score = float(scores[index]) if scores is not None else 0.0
+            lines.append((text, sum(ys) / len(ys), score))
+        return lines
 
     def read(self, crop: np.ndarray) -> list[tuple[str, float, float]]:
         """Return (text, y-centre, confidence) for each line found in the crop."""
@@ -157,24 +210,12 @@ class OcrEngine:
             # rescaled image the CPU detector needs.
             return self._hailo.read(crop)
 
-        engine = self._ensure()
-
         prepared = soft_ink(crop)
         if self.cfg.deskew:
             angle = deskew_angle(crop, self.cfg_detect)
             prepared = rotate(prepared, angle)
         prepared = scale_for_ocr(prepared, crop, self.cfg, self.cfg_detect)
-
-        with self._lock:
-            result, _ = engine(prepared)
-        if not result:
-            return []
-
-        lines: list[tuple[str, float, float]] = []
-        for box, text, confidence in result:
-            ys = [point[1] for point in box]
-            lines.append((text, float(sum(ys) / len(ys)), float(confidence)))
-        return lines
+        return self._run(prepared)
 
 
 class OcrWorker:
