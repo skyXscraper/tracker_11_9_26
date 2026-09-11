@@ -4,3 +4,4 @@ __pycache__/
 output/
 config.json
 .pytest_cache/
+videos/
