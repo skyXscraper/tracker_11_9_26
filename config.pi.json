@@ -1,0 +1,22 @@
+{
+  "capture": {
+    "width": 960,
+    "height": 1080,
+    "fps": 25,
+    "fourcc": "MJPG"
+  },
+  "detect": {
+    "scale": 0.35,
+    "detect_every": 3
+  },
+  "ocr": {
+    "num_threads": 2,
+    "min_interval_s": 0.6,
+    "max_per_frame": 1,
+    "queue_size": 3
+  },
+  "output": {
+    "display": false,
+    "dir": "output"
+  }
+}

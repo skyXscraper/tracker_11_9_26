@@ -1,0 +1,14 @@
+# Roll OCR + tracking. Installs as-is on Raspberry Pi OS (aarch64) and Windows.
+#
+# OCR is PP-OCR (PaddleOCR's detection and recognition models) executed on ONNX
+# Runtime rather than the PaddlePaddle runtime. Same models, same accuracy,
+# but the session holds a few hundred MB instead of well over a gigabyte --
+# which is what makes two camera pipelines fit on a 2 GB Pi 5.
+rapidocr-onnxruntime>=1.3.0
+onnxruntime>=1.17.0
+
+opencv-python>=4.8.0
+numpy>=1.24.0
+
+# Tests only.
+pytest>=7.4.0
