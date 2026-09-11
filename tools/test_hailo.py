@@ -52,6 +52,67 @@ def grab(args):
     return image
 
 
+def synthetic_line(text: str = "4.7-17.5") -> np.ndarray:
+    """Printed text on white -- a control any OCR model should read easily.
+
+    If this fails too, the fault is in the plumbing (input format, layout,
+    dequantisation) rather than in the handwriting or the crop.
+    """
+    canvas = np.full((64, 300, 3), 255, np.uint8)
+    cv2.putText(canvas, text, (10, 46), cv2.FONT_HERSHEY_SIMPLEX, 1.2, (0, 0, 0), 3, cv2.LINE_AA)
+    return canvas
+
+
+def describe_output(tag: str, out: np.ndarray, charset: list[str]) -> None:
+    print(f"  [{tag}] raw shape={out.shape} dtype={out.dtype} "
+          f"min={float(out.min()):.4f} max={float(out.max()):.4f}")
+    probs = out.reshape(-1, out.shape[-1])
+    indices = probs.argmax(axis=1)
+    scores = probs.max(axis=1)
+    print(f"  [{tag}] argmax per step: {indices.tolist()}")
+    print(f"  [{tag}] max prob per step: {np.round(scores, 3).tolist()}")
+    nonblank = [(step, int(c), round(float(p), 3),
+                 charset[c] if c < len(charset) else "?")
+                for step, (c, p) in enumerate(zip(indices, scores)) if c != 0]
+    print(f"  [{tag}] non-blank steps: {nonblank[:24]}")
+    # Sum probability per class across time, ignoring blank, to see what the
+    # network leans towards even when blank wins every individual step.
+    totals = probs.sum(axis=0)
+    totals[0] = 0
+    top = np.argsort(totals)[-8:][::-1]
+    print(f"  [{tag}] strongest non-blank classes: "
+          f"{[(int(c), charset[c] if c < len(charset) else '?', round(float(totals[c]), 2)) for c in top]}")
+
+
+def debug_raw(recognizer, crop, bands) -> None:
+    """Dump what the network actually emits, for several input formats."""
+    from rollocr.hailo_ocr import preprocess_line
+
+    print("\n[debug] === raw network output ===")
+    samples = [("synthetic-printed", synthetic_line())]
+    for i, (top, bottom) in enumerate(bands):
+        samples.append((f"fixture-line{i}", crop[top:bottom + 1]))
+
+    for tag, image in samples:
+        prepared = preprocess_line(image)
+        try:
+            out = recognizer._infer(np.stack([prepared]).astype(np.uint8))
+        except Exception as exc:
+            print(f"  [{tag}] inference failed: {exc}")
+            continue
+        describe_output(tag, np.asarray(out)[0], recognizer.charset)
+
+        # The compiled model's colour order is not stated anywhere; try the
+        # other one before concluding the model simply cannot read this.
+        swapped = prepared[:, :, ::-1].copy()
+        try:
+            out = recognizer._infer(np.stack([swapped]).astype(np.uint8))
+            describe_output(tag + "/channel-swapped", np.asarray(out)[0], recognizer.charset)
+        except Exception as exc:
+            print(f"  [{tag}/swapped] inference failed: {exc}")
+        print()
+
+
 def main() -> int:
     for stream in (sys.stdout, sys.stderr):
         try:
@@ -69,6 +130,8 @@ def main() -> int:
     parser.add_argument("--config")
     parser.add_argument("--runs", type=int, default=5, help="timed repetitions")
     parser.add_argument("--save-lines", help="write the split line images here")
+    parser.add_argument("--debug", action="store_true",
+                        help="dump raw network output and run format controls")
     args = parser.parse_args()
 
     cfg = Config.load(args.config)
@@ -122,6 +185,9 @@ def main() -> int:
         ply, ranges = parse_lines(lines, cfg.values)
         print(f"[hailo] parsed -> ply {ply}  "
               f"{[(r.start, r.end) for r in ranges[:3]]}")
+
+    if recognizer is not None and args.debug:
+        debug_raw(recognizer, crop, bands)
 
     # -- CPU, for comparison ----------------------------------------------
     print("\n[cpu] loading rapidocr...")
