@@ -56,6 +56,9 @@ class Track:
     ocr_attempts: int = 0
     last_ocr_at: float = 0.0
     pending_ocr: bool = False
+    last_crop = None          # the image the most recent read was taken from
+    snapshot_path = None      # where that image was last written, if saved
+    logged_id = None          # the global id this track last wrote a row under
 
     confirmed_ply: str | None = None
     confirmed_range: tuple[str, str] | None = None

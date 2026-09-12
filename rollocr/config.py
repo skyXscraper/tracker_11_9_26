@@ -149,7 +149,17 @@ class OutputConfig:
     csv_name: str = "rolls.csv"
     display: bool = True
     display_scale: float = 0.5
-    record: bool = False
+
+    # Every run leaves something you can look at afterwards. Recording is on by
+    # default because a run whose result you cannot see is a run you have to do
+    # again; pass --no-record on the Pi if you need the last few frames per
+    # second back.
+    record: bool = True
+    # Each run gets its own timestamped folder, so a new test never overwrites
+    # the evidence from the last one.
+    per_run_dir: bool = True
+    # A cropped snapshot of each roll at the moment it was read.
+    save_roll_images: bool = True
     annotate_fps: bool = True
 
 

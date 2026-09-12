@@ -333,9 +333,25 @@ python run.py --cam1 /dev/video0 --cam2 /dev/video2 --config config.json
 
 ### Output
 
-`output/sightings.jsonl` — every read and every confirmation, in order,
-including readings that disagreed with the list. `output/rolls.csv` — one row
-per roll, rewritten as results firm up.
+Every run writes its own timestamped folder under `output/`, so a new test
+never overwrites the evidence from the last one:
+
+```
+output/20260912-145534_cam0_test3+cam2_test3/
+    annotated.mp4      both views, boxed and captioned, with the FPS header
+    rolls.csv          one row per roll: ply, range, status, confidence
+    sightings.jsonl    every OCR read in order, including the failures
+    rolls/ROLL-19.jpg  the crop each reading came from, captioned with it
+```
+
+The per-roll snapshots are the quickest way to tell a bad read from a bad
+detection: the caption says what the pipeline reported, and the image beside it
+shows what was actually written. An image run writes the same folder with an
+annotated JPEG instead of a video.
+
+Recording is on by default. Pass `--no-record` to skip the annotated video when
+you want the last few frames per second back on the Pi, and `--no-run-dir` to
+write straight into `--output` instead of a timestamped subfolder.
 
 On screen, a strip across the top leads with the **pipeline frame rate** — how
 fast the loop is actually getting through frames, which is the number that says

@@ -43,6 +43,23 @@ from rollocr.sources import open_source
 IMAGE_SUFFIXES = {".jpg", ".jpeg", ".png", ".bmp", ".webp", ".tif", ".tiff"}
 
 
+def run_directory(output_cfg, sources) -> str:
+    """A folder of its own for this run, named for when and what.
+
+    Without this, every run overwrites the last one's annotated video and CSV,
+    and comparing a change against the run before it means having remembered to
+    copy the results out first.
+    """
+    if not output_cfg.per_run_dir:
+        return output_cfg.dir
+    labels = []
+    for spec in sources:
+        stem = Path(spec).stem if not str(spec).isdigit() else f"cam{spec}"
+        labels.append("".join(ch for ch in stem if ch.isalnum() or ch in "-_")[:24])
+    stamp = time.strftime("%Y%m%d-%H%M%S")
+    return str(Path(output_cfg.dir) / f"{stamp}_{'+'.join(labels) or 'run'}")
+
+
 def is_image(spec: str) -> bool:
     return Path(spec).suffix.lower() in IMAGE_SUFFIXES
 
@@ -57,7 +74,10 @@ def build_args() -> argparse.Namespace:
     parser.add_argument("--config", help="JSON file overriding any config field")
     parser.add_argument("--output", help="output directory")
     parser.add_argument("--no-display", action="store_true", help="headless (use on the Pi)")
-    parser.add_argument("--record", action="store_true", help="write an annotated video")
+    parser.add_argument("--no-record", action="store_true",
+                        help="skip the annotated video (a little faster on the Pi)")
+    parser.add_argument("--no-run-dir", action="store_true",
+                        help="write straight into --output instead of a timestamped subfolder")
     parser.add_argument("--realtime", action="store_true",
                         help="pace video files at their own frame rate")
     parser.add_argument("--max-seconds", type=float, help="stop after this long")
@@ -82,8 +102,11 @@ def main() -> int:
         cfg.output.dir = args.output
     if args.no_display:
         cfg.output.display = False
-    if args.record:
-        cfg.output.record = True
+    if args.no_record:
+        cfg.output.record = False
+    if args.no_run_dir:
+        cfg.output.per_run_dir = False
+    cfg.output.dir = run_directory(cfg.output, args.sources)
 
     names = args.names or ["cam1", "cam2"]
     if len(names) < len(args.sources):
@@ -126,6 +149,8 @@ def main() -> int:
     finished = set()
     confirmed_count = 0
 
+    print(f"[init] results -> {cfg.output.dir}"
+          f"{'  (annotated video on)' if cfg.output.record else ''}")
     print("[run] press q in the window, or ctrl-c, to stop")
     try:
         while len(finished) < len(pipelines):
@@ -215,6 +240,10 @@ def run_image(path: str, cfg) -> int:
     detections = detector.detect(image)
     print(f"[image] markings found: {len(detections)}")
 
+    out_dir = Path(cfg.output.dir)
+    out_dir.mkdir(parents=True, exist_ok=True)
+    rolls_dir = out_dir / "rolls"
+
     canvas = image.copy()
     found = 0
     for index, detection in enumerate(detections, 1):
@@ -231,16 +260,19 @@ def run_image(path: str, cfg) -> int:
         values = f"{readings[0].start}-{readings[0].end}" if readings else "?"
         print(f"  [{index}] ply {ply or '?':<6} {values:<18} raw={raw}")
 
+        if cfg.output.save_roll_images:
+            rolls_dir.mkdir(parents=True, exist_ok=True)
+            cv2.imwrite(str(rolls_dir / f"marking{index}_ply{ply or 'unknown'}.jpg"), crop)
+
         x0, y0, x1, y1 = detection.writing_bbox
         cv2.rectangle(canvas, (x0, y0), (x1, y1), (80, 200, 90), 2)
         cv2.putText(canvas, f"ply {ply or '?'}  {values}", (x0, max(18, y0 - 8)),
                     cv2.FONT_HERSHEY_SIMPLEX, 0.6, (80, 200, 90), 2, cv2.LINE_AA)
 
-    out_dir = Path(cfg.output.dir)
-    out_dir.mkdir(parents=True, exist_ok=True)
     out_path = out_dir / (Path(path).stem + "_annotated.jpg")
     cv2.imwrite(str(out_path), canvas)
-    print(f"[image] {found} marking(s) read; annotated -> {out_path}")
+    print(f"[image] {found} marking(s) read")
+    print(f"[image] results -> {out_dir}")
     return 0
 
 
@@ -285,7 +317,17 @@ def handle_ocr(worker, pipelines, registry, cfg, log, now, quiet: bool) -> int:
                       start=roll.read_start, end=roll.read_end,
                       range=roll.range_text, status=roll.status,
                       confidence=roll.confidence)
+            # The roll may have just been re-keyed from its placeholder id;
+            # retire the row written under the old one.
+            if track.logged_id and track.logged_id != roll.global_id:
+                log.drop(track.logged_id)
+            track.logged_id = roll.global_id
             log.roll(roll)
+            # Re-saved on every confirmation, not just the first: a roll is
+            # re-keyed when its ply is finally read, and a snapshot still
+            # named after the placeholder ID cannot be matched to its CSV row.
+            if cfg.output.save_roll_images:
+                save_roll_image(cfg, roll, track)
             if first_report or not quiet:
                 print("[roll] " + describe(roll, result.camera))
     return confirmed
@@ -349,11 +391,46 @@ def render(frames, pipelines, registry, cfg, worker, pipeline_fps=0.0):
 def ensure_writer(writer, canvas, cfg):
     if writer is not None:
         return writer
+    Path(cfg.output.dir).mkdir(parents=True, exist_ok=True)
     path = f"{cfg.output.dir}/annotated.mp4"
     fourcc = cv2.VideoWriter_fourcc(*"mp4v")
     writer = cv2.VideoWriter(path, fourcc, 15.0, (canvas.shape[1], canvas.shape[0]))
     print(f"[run] recording annotated view to {path}")
     return writer
+
+
+def save_roll_image(cfg, roll, track) -> None:
+    """Save the crop this roll was read from, captioned with what it said.
+
+    The annotated video shows the whole pass; this is the single frame that
+    produced the reading, which is what you want when a number looks wrong.
+    """
+    crop = getattr(track, "last_crop", None)
+    if crop is None or getattr(crop, "size", 0) == 0:
+        return
+    caption = "ply {}   {}".format(roll.read_ply or "?", roll.range_text)
+    # Big enough to judge the handwriting against the reading by eye, which is
+    # the whole reason for saving it.
+    scale = min(6.0, max(1.0, 360.0 / max(crop.shape[0], 1)))
+    canvas = cv2.resize(crop, None, fx=scale, fy=scale, interpolation=cv2.INTER_CUBIC)
+    banner = 40
+    canvas = cv2.copyMakeBorder(canvas, banner, 0, 0, 0,
+                                cv2.BORDER_CONSTANT, value=(20, 20, 20))
+    cv2.putText(canvas, caption, (10, banner - 12), cv2.FONT_HERSHEY_SIMPLEX,
+                0.8, (90, 220, 110), 2, cv2.LINE_AA)
+
+    rolls_dir = Path(cfg.output.dir) / "rolls"
+    rolls_dir.mkdir(parents=True, exist_ok=True)
+    path = rolls_dir / f"{roll.global_id}.jpg"
+
+    previous = getattr(track, "snapshot_path", None)
+    if previous is not None and previous != path:
+        try:
+            previous.unlink()          # drop the placeholder-named copy
+        except OSError:
+            pass
+    cv2.imwrite(str(path), canvas)
+    track.snapshot_path = path
 
 
 def describe(roll, camera: str | None = None) -> str:
@@ -374,7 +451,12 @@ def summarise(registry, log, worker, started, confirmed_count) -> None:
     print(f"[done] rolls read: {len(rolls)}  (confirmations: {confirmed_count})")
     for roll in sorted(rolls, key=lambda r: r.first_seen):
         print("       " + describe(roll))
-    print(f"[done] results: {log.csv_path}  events: {log.jsonl_path}")
+    print(f"[done] results -> {Path(log.csv_path).parent}")
+    print(f"       {Path(log.csv_path).name}, {Path(log.jsonl_path).name}"
+          f"{', annotated.mp4' if worker and Path(log.csv_path).with_name('annotated.mp4').exists() else ''}")
+    rolls_dir = Path(log.csv_path).parent / "rolls"
+    if rolls_dir.exists():
+        print(f"       rolls/ ({len(list(rolls_dir.glob('*.jpg')))} snapshots)")
 
 
 if __name__ == "__main__":

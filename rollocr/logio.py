@@ -60,6 +60,16 @@ class ResultLog:
         }
         self._flush_csv()
 
+    def drop(self, global_id: str) -> None:
+        """Remove a superseded row.
+
+        A roll is re-keyed once, when its ply is finally read: it starts as a
+        placeholder and becomes ROLL-<ply>. Without this the summary carries
+        both, and one physical roll appears twice.
+        """
+        if self._rows.pop(global_id, None) is not None:
+            self._flush_csv()
+
     def _flush_csv(self) -> None:
         with self.csv_path.open("w", newline="", encoding="utf-8") as handle:
             writer = csv.DictWriter(handle, fieldnames=CSV_FIELDS)

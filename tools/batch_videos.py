@@ -154,6 +154,9 @@ def fold_results(worker, pipeline, registry, cfg, log, now, quiet) -> int:
                       start=roll.read_start, end=roll.read_end,
                       range=roll.range_text, status=roll.status,
                       confidence=roll.confidence)
+            if track.logged_id and track.logged_id != roll.global_id:
+                log.drop(track.logged_id)
+            track.logged_id = roll.global_id
             log.roll(roll)
             if first and not quiet:
                 print(f"    [roll] {roll.global_id}   ply {roll.read_ply or '?'}"

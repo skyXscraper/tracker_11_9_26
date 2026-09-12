@@ -121,6 +121,7 @@ class CameraPipeline:
             if crop is None:
                 continue
             track.pending_ocr = True
+            track.last_crop = crop      # kept so the read can be shown later
             track.last_ocr_at = now
             track.ocr_attempts += 1
             self.submitted += 1
