@@ -67,28 +67,32 @@ def test_out_of_order_reading_is_kept_not_discarded():
     assert (readings[0].start, readings[0].end) == ("54.7", "9.2")
 
 
-def test_every_master_row_round_trips(master):
-    """Simulate the worst case -- the operator wrote dots throughout -- and
-    check every row in the list still resolves to exactly its own values."""
+def test_the_parser_alone_resolves_almost_every_real_value(master):
+    """The worst case: the operator wrote dots throughout, so the digit string
+    alone must be split correctly.
+
+    The packing list supplies realistic value pairs to test against, but is
+    never consulted to make the decision -- the parser gets only the digits, as
+    it does at runtime. 53 of 54 resolve on the constraints alone; the last
+    ("5.9"/"16", equally readable as "5"/"9.16") is genuinely ambiguous.
+    """
     wrong = []
     for row in master.rows:
         readings = parse_range(f"{row.start}.{row.end}", CFG)
-        assert readings, f"no reading for ply {row.ply_no}"
-        chosen, _ = master.choose_reading(row.ply_no, readings, CFG)
-        if (chosen.start, chosen.end) != (row.start, row.end):
-            wrong.append((row.ply_no, row.start, row.end, chosen.start, chosen.end))
-    assert not wrong, f"mis-split rows: {wrong}"
+        assert readings, f"no reading for {row.start}/{row.end}"
+        if (readings[0].start, readings[0].end) != (row.start, row.end):
+            wrong.append((row.ply_no, row.start, row.end,
+                          readings[0].start, readings[0].end))
+    assert len(wrong) <= 1, f"mis-split rows: {wrong}"
 
 
-def test_first_guess_alone_resolves_almost_every_row(master):
-    """Without consulting the master list at all, the constraints should still
-    pick the right split for the overwhelming majority of rows."""
-    correct = sum(
-        1 for row in master.rows
-        if (lambda r: r and (r[0].start, r[0].end) == (row.start, row.end))(
-            parse_range(f"{row.start}.{row.end}", CFG))
-    )
-    assert correct >= len(master.rows) - 1
+def test_the_true_reading_is_never_discarded(master):
+    """Even where the split is ambiguous, the correct pair must survive as a
+    candidate -- ranking may demote it, but nothing may drop it."""
+    for row in master.rows:
+        readings = parse_range(f"{row.start}.{row.end}", CFG)
+        pairs = [(r.start, r.end) for r in readings]
+        assert (row.start, row.end) in pairs, f"lost {row.start}/{row.end}"
 
 
 # -- ply number --------------------------------------------------------------
@@ -143,22 +147,24 @@ def test_noise_produces_no_reading():
     assert parse_range("7", CFG) == []          # a single group cannot be a pair
 
 
-# -- master list is identity only, never a source of values -------------------
+# -- the packing list is not part of the runtime path ------------------------
 
-def test_master_never_supplies_values(master):
-    """A reading that matches no row keeps the numbers that were read."""
+def test_master_module_exposes_no_identification_helpers(master):
+    """Guards the rule directly: nothing may resolve a reading against the list.
+
+    These helpers existed and were removed. If one comes back, a reading can
+    once again be relabelled to whatever the list expected, and the station
+    stops verifying anything.
+    """
+    for gone in ("best_match", "lookup_by_values", "choose_reading", "validate"):
+        assert not hasattr(master, gone), f"{gone} must not be reintroduced"
+
+
+def test_a_reading_matching_no_row_is_still_a_valid_reading(master):
+    """54.7-9.2 appears in no row. The parser must still return it."""
     readings = parse_range("54.7-9.2", CFG)
-    chosen, status = master.choose_reading("88", readings, CFG)
-    assert (chosen.start, chosen.end) == ("54.7", "9.2")
-    assert status == "mismatch"
-    row = master.lookup("88")
-    assert (row.start, row.end) == ("48.3", "65.433")   # untouched, for comparison
-
-
-def test_values_identify_a_roll_when_the_ply_is_unreadable(master):
-    row = master.rows[0]
-    found = master.lookup_by_values(row.start, row.end)
-    assert found is not None and found.ply_no == row.ply_no
+    assert (readings[0].start, readings[0].end) == ("54.7", "9.2")
+    assert master.lookup("54") is None
 
 
 def test_span_matches_length_column_for_every_row(master):

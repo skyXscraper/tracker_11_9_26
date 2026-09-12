@@ -162,6 +162,9 @@ class Config:
     values: ValueConfig = field(default_factory=ValueConfig)
     identity: IdentityConfig = field(default_factory=IdentityConfig)
     output: OutputConfig = field(default_factory=OutputConfig)
+    # Not used by the pipeline: readings are never resolved against the
+    # packing list. Kept for tools/compare_to_master.py, which compares a
+    # finished run afterwards with both columns visible.
     master_csv: str = "data/master_list.csv"
 
     @classmethod

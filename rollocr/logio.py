@@ -1,13 +1,12 @@
 """Result output: an append-only event log plus a one-row-per-roll summary.
 
-Two files because they answer different questions. The JSONL is the audit
-trail - every sighting and every confirmed read, in order, including reads that
-disagreed with the master list. The CSV is the operational view: the current
-state of each roll seen in this run, rewritten as results firm up.
+Every column here is something OCR read off a roll. There are no "expected"
+columns: the pipeline does not consult the packing list, so it has nothing to
+compare against and says only what it saw.
 
-Everything is written UTF-8. The PP-OCR recognition model carries a CJK
-charset and will occasionally emit a non-Latin character from noise, which
-crashes a default-encoded writer on Windows.
+Everything is written UTF-8. The PP-OCR recognition model carries a CJK charset
+and will occasionally emit a non-Latin character from noise, which crashes a
+default-encoded writer on Windows.
 """
 
 from __future__ import annotations
@@ -17,15 +16,9 @@ import json
 import time
 from pathlib import Path
 
-# read_* is what the camera saw; matched_/expected_* is what the master list
-# says. Keeping both in every row is the point -- a reader can always tell an
-# OCR reading from a list lookup.
 CSV_FIELDS = [
-    "global_id", "read_ply", "read_start", "read_end", "read_span_m",
-    "matched_ply", "ply_source", "match_score", "status",
-    "expected_start", "expected_end", "expected_length_m",
-    "item_number", "item_description",
-    "confidence", "cameras", "first_seen", "last_seen",
+    "global_id", "ply_no", "range", "start", "end", "span_m",
+    "status", "confidence", "cameras", "first_seen", "last_seen",
 ]
 
 
@@ -45,7 +38,7 @@ class ResultLog:
         self._jsonl.flush()
 
     def roll(self, roll) -> None:
-        """Record or refresh the summary row for a confirmed roll."""
+        """Record or refresh the summary row for a roll that has been read."""
         span = ""
         if roll.read_start and roll.read_end:
             try:
@@ -54,19 +47,12 @@ class ResultLog:
                 span = ""
         self._rows[roll.global_id] = {
             "global_id": roll.global_id,
-            "read_ply": roll.read_ply or "",
-            "read_start": roll.read_start or "",
-            "read_end": roll.read_end or "",
-            "read_span_m": span,
-            "matched_ply": roll.matched_ply or "",
-            "ply_source": roll.ply_source or "",
-            "match_score": roll.match_score,
+            "ply_no": roll.read_ply or "",
+            "range": roll.range_text,
+            "start": roll.read_start or "",
+            "end": roll.read_end or "",
+            "span_m": span,
             "status": roll.status,
-            "expected_start": roll.expected_start or "",
-            "expected_end": roll.expected_end or "",
-            "expected_length_m": roll.expected_length_m or "",
-            "item_number": roll.item_number or "",
-            "item_description": roll.item_description or "",
             "confidence": roll.confidence,
             "cameras": "|".join(roll.camera_names),
             "first_seen": round(roll.first_seen, 3),

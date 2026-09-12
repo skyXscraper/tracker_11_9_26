@@ -24,7 +24,6 @@ import cv2
 from rollocr import annotate
 from rollocr.config import Config
 from rollocr.logio import ResultLog
-from rollocr.master import MasterList
 from rollocr.ocr import OcrEngine, OcrWorker, SyncOcrRunner
 from rollocr.parse import parse_lines
 from rollocr.pipeline import CameraPipeline
@@ -40,7 +39,6 @@ def build_args() -> argparse.Namespace:
     parser.add_argument("--name1", default="cam1")
     parser.add_argument("--name2", default="cam2")
     parser.add_argument("--config", help="JSON file overriding any config field")
-    parser.add_argument("--master", help="path to master_list.csv")
     parser.add_argument("--output", help="output directory")
     parser.add_argument("--no-display", action="store_true", help="headless (use on the Pi)")
     parser.add_argument("--record", action="store_true", help="write an annotated video")
@@ -62,8 +60,6 @@ def main() -> int:
 
     args = build_args()
     cfg = Config.load(args.config)
-    if args.master:
-        cfg.master_csv = args.master
     if args.output:
         cfg.output.dir = args.output
     if args.no_display:
@@ -71,9 +67,9 @@ def main() -> int:
     if args.record:
         cfg.output.record = True
 
-    master = MasterList.load(cfg.master_csv)
-    print(f"[init] master list: {len(master.rows)} rolls from {cfg.master_csv}")
-
+    # No packing list is loaded: the pipeline reports what OCR read and
+    # nothing else. Compare a finished run against the list afterwards with
+    # tools/compare_to_master.py, where both columns stay visible.
     pipelines = {}
     for spec, name in ((args.cam1, args.name1), (args.cam2, args.name2)):
         source = open_source(spec, name, cfg.capture, realtime=args.realtime)
@@ -139,7 +135,7 @@ def main() -> int:
                 for track in dropped:
                     registry.release(name, track.id)
 
-            confirmed_count += handle_ocr(worker, pipelines, registry, master, cfg, log, now,
+            confirmed_count += handle_ocr(worker, pipelines, registry, cfg, log, now,
                                           quiet=args.quiet)
             registry.cleanup(now)
 
@@ -172,7 +168,7 @@ def main() -> int:
     return 0
 
 
-def handle_ocr(worker, pipelines, registry, master, cfg, log, now, quiet: bool) -> int:
+def handle_ocr(worker, pipelines, registry, cfg, log, now, quiet: bool) -> int:
     """Fold finished OCR results back into their tracks, and confirm identities."""
     confirmed = 0
     for result in worker.drain():
@@ -188,7 +184,9 @@ def handle_ocr(worker, pipelines, registry, master, cfg, log, now, quiet: bool) 
 
         track.raw_reads.append([text for text, _, _ in result.lines])
         ply, readings = parse_lines(result.lines, cfg.values)
-        chosen, _status = master.choose_reading(ply, readings, cfg.values)
+        # Best reading by the parser's own constraints. Nothing is consulted to
+        # decide which roll this "must" be.
+        chosen = readings[0] if readings else None
         before = (track.confirmed_ply, track.confirmed_range)
         track.add_reading(ply, chosen, cfg.ocr)
         after = (track.confirmed_ply, track.confirmed_range)
@@ -201,18 +199,15 @@ def handle_ocr(worker, pipelines, registry, master, cfg, log, now, quiet: bool) 
         # Re-confirm on any change, not just the first: the ply line often
         # arrives several frames after the lengths, once the roll turns.
         if track.complete and after != before:
-            roll = registry.confirm(result.camera, track, master, cfg.values, now)
+            roll = registry.confirm(result.camera, track, now)
             track.global_id = roll.global_id
             first_report = not track.reported
             track.reported = True
             confirmed += 1 if first_report else 0
             log.event("confirmed", camera=result.camera, track=track.id,
-                      global_id=roll.global_id, read_ply=roll.read_ply,
-                      read_start=roll.read_start, read_end=roll.read_end,
-                      matched_ply=roll.matched_ply, ply_source=roll.ply_source,
-                      match_score=roll.match_score, status=roll.status,
-                      expected_start=roll.expected_start,
-                      expected_end=roll.expected_end,
+                      global_id=roll.global_id, ply=roll.read_ply,
+                      start=roll.read_start, end=roll.read_end,
+                      range=roll.range_text, status=roll.status,
                       confidence=roll.confidence)
             log.roll(roll)
             if first_report or not quiet:
@@ -286,27 +281,13 @@ def ensure_writer(writer, canvas, cfg):
 
 
 def describe(roll, camera: str | None = None) -> str:
-    """One line stating what was read and, separately, what it matched.
-
-    The two are never merged: an operator reading this must be able to tell a
-    number the camera saw from a number the master list supplied.
-    """
-    read = "read " + roll.read_range_text
-    if roll.read_ply:
-        read = "read ply {}  {}".format(roll.read_ply, roll.read_range_text)
+    """One line in the format the marking is written in: ply, then start-end."""
     where = " ({})".format(camera) if camera else " [{}]".format(
         "+".join(roll.camera_names) or "-")
-
-    if roll.status == "unidentified":
-        return "{}  {}  -- no master row resembles this{}".format(
-            roll.global_id, read, where)
-
-    tail = ""
-    if roll.status == "value_mismatch":
-        tail = "  -- list says {} - {} (match {} via {})".format(
-            roll.expected_start, roll.expected_end, roll.match_score, roll.ply_source)
-    return "{}  ply {}  {}{}  conf {}{}".format(
-        roll.global_id, roll.matched_ply, read, tail, roll.confidence, where)
+    tail = "  (ply not read)" if roll.status == "partial" else ""
+    return "{}   ply {:<6} {:<18} conf {}{}{}".format(
+        roll.global_id, roll.read_ply or "?", roll.range_text,
+        roll.confidence, where, tail)
 
 
 def summarise(registry, log, worker, started, confirmed_count) -> None:
@@ -314,7 +295,7 @@ def summarise(registry, log, worker, started, confirmed_count) -> None:
     print(f"\n[done] {elapsed:.1f}s  ocr_calls={worker.processed}  "
           f"dropped={worker.dropped}")
     rolls = [r for r in registry.rolls.values() if not r.provisional]
-    print(f"[done] rolls identified: {len(rolls)}  (confirmations: {confirmed_count})")
+    print(f"[done] rolls read: {len(rolls)}  (confirmations: {confirmed_count})")
     for roll in sorted(rolls, key=lambda r: r.first_seen):
         print("       " + describe(roll))
     print(f"[done] results: {log.csv_path}  events: {log.jsonl_path}")

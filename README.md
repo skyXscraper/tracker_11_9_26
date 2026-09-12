@@ -9,7 +9,7 @@ the cameras that will be deployed.
 ```
 python run.py --cam1 videos/cam0_test1.mp4 --cam2 videos/cam2_test1.mp4   # offline
 python run.py --cam1 /dev/video0 --cam2 /dev/video2 --no-display          # on the Pi
-python -m pytest tests/ -q                                                # 62 tests
+python -m pytest tests/ -q                                                # 60 tests
 ```
 
 ---
@@ -51,10 +51,11 @@ The digit string alone is ambiguous. Three constraints resolve it:
 - both values are under 100 m (the list tops out at 65.433),
 - the end reading normally exceeds the start.
 
-Against the supplied master list this leaves **exactly one legal reading for 53
-of the 54 rows**, and never discards the true one. The last row (`5.9`/`16`,
-which could also read `5`/`9.16`) is settled by the ply number's own master
-entry. `tests/test_parse.py` pins all 54.
+Measured against a real packing list of 54 rows, this leaves **exactly one
+legal reading for 53 of them**, and never discards the true one. The last
+(`5.9`/`16`, equally readable as `5`/`9.16`) stays genuinely ambiguous and the
+best-ranked candidate is taken — the list is not consulted to break the tie.
+`tests/test_parse.py` pins all 54, feeding the parser only the digits.
 
 The ordering rule is a **preference, not a filter**. A roll clipped by the frame
 edge loses digits, and a reading that looks out of order is usually a truncated
@@ -81,25 +82,27 @@ things did help and are in the pipeline — cropping tight to the ink rather tha
 to a dilated blob, and darkening strokes *proportionally to redness* instead of
 thresholding — but neither corrects the misreads above.
 
-**What the system does about it.** The master list is a closed set of 54 rolls,
-which turns an open-ended handwriting problem into a 54-way choice. The digits
-that were read are scored against every row, and the best match above a
-threshold identifies the roll. `19` + `4.7-135` matches ply 99 at 0.80 and the
-roll is correctly identified; the genuinely-absent test roll `54.7-9.2` matches
-nothing and is reported as unidentified rather than forced onto a row.
+**What the system does about it: nothing.** It reports the reading. An earlier
+version scored the OCR'd digits against all 54 packing-list rows and adopted
+the best-matching row's ply number, so `19` + `4.7-135` was reported as ply 99.
+That was removed deliberately. The station exists to verify what is handwritten
+on each roll, and a pipeline that resolves its answer against the expected
+answer verifies nothing -- a mislabelled roll would quietly display the
+expected numbers and pass.
 
-**What it deliberately does not do.** The list decides *which roll this is*. It
-never decides *what is written on it*. Every result carries both:
+So the packing list is not consulted at runtime at all: not for values, not for
+identity, not to break a tie between two possible splits. Output is exactly
+what was read, in the format the marking is written in:
 
 | column | meaning |
 |---|---|
-| `read_ply`, `read_start`, `read_end` | what the camera actually read |
-| `matched_ply`, `expected_start`, `expected_end` | what the master list says |
-| `ply_source` | `ocr_exact`, `values_exact`, or `fuzzy` |
-| `status` | `match`, `value_mismatch`, or `unidentified` |
+| `ply_no` | the ply number as read, blank if the line was not legible |
+| `range` | the lengths as read, `start-end` |
+| `start`, `end`, `span_m` | the same values, split out |
+| `status` | `read` (both lines) or `partial` (lengths only) |
 
-A `value_mismatch` row is the normal outcome for a fuzzy match, and it is
-supposed to be visible. Nothing is silently corrected into a plausible number.
+`tools/compare_to_master.py` compares a finished run against the list
+afterwards, with both columns side by side and the difference obvious.
 
 **If you need the read values themselves to be right** — as opposed to just
 identifying the roll — the answer is a recogniser fine-tuned on this plant's
@@ -116,7 +119,7 @@ data-collection task, not a code change.
           │                                     │                    │
           └─────────────── annotate ◄───────────┴──── vote ◄─────────┘
                                                        │
-                                              master list: identify
+                                         ply + start-end, as read
                                                        │
                                             JSONL events + CSV summary
 ```
@@ -128,7 +131,7 @@ data-collection task, not a code change.
 | `track.py` | greedy IoU/centroid tracking, and multi-frame vote accumulation |
 | `ocr.py` | PP-OCR on ONNX Runtime; one engine, one worker thread |
 | `parse.py` | OCR text → `(ply, start, end)`, including the dotted-separator split |
-| `master.py` | the list: exact lookup, value lookup, fuzzy match, validation |
+| `master.py` | the packing list, for after-the-fact comparison only |
 | `identity.py` | one global ID per roll, across both cameras |
 | `pipeline.py` | when it is worth spending an OCR call |
 | `logio.py` | JSONL audit trail + CSV summary, both UTF-8 |
@@ -136,16 +139,14 @@ data-collection task, not a code change.
 
 ### Identity across the two cameras
 
-Resolved in order of how much the evidence is worth:
+From the reading and from tracking — never from a lookup:
 
-1. **Ply number read off the roll** — unique in the list, decides outright.
-2. **Exact length pair** — also unique per row, so it recovers a roll whose ply
-   line was clipped off the top of frame.
-3. **Fuzzy match** against the list, for the systematic misreads above.
-4. **Co-occurrence in the overlap zone** — two tracks in both cameras at the
+1. **Ply number read off the roll.** Two tracks that read the same ply are the
+   same roll, in either camera.
+2. **Co-occurrence in the overlap zone** — two tracks in both cameras at the
    same moment are the same roll, so the ID is stable from the first frame
    rather than appearing only once the writing is read.
-5. **Twin merge** — an unidentified roll the other camera read the same way
+3. **Twin merge** — an unidentified roll the other camera read the same way
    recently is the same roll. Its window (`twin_window_s`, 30 s) is separate
    from the co-occurrence window on purpose: in the test recordings the
    operator presented a roll to one camera and then walked to the other, 14 s
@@ -335,30 +336,37 @@ list resembles it.
 
 ## Current results on the supplied recordings
 
-| pair | rolls reported | outcome |
-|---|---|---|
-| `cam0_test3` / `cam2_test3` | 1 | correctly identified as **ply 99**, one ID across both cameras |
-| `cam0_test1` / `cam2_test1` | 1 | reads `54.7-9.2`, which is in no master row — correctly reported as unidentified rather than forced onto a row, and still one ID across both cameras |
-| `cam0_test2` / `cam2_test2` | 2 | ply 99 identified from camera 1; camera 2's partial read (`4 - 1.135`) scored too low to match and is reported separately as unidentified |
+Ground truth for pairs 2 and 3 is ply **99**, **4.7-17.5**; the pair-1 roll is
+not in the packing list at all.
 
-Two of the three passes give exactly one record for the one roll that went by.
-The pair-2 split is the expected shape of a bad read: rather than guess, the
-system reports what it saw and marks it unidentified.
+| pair | rolls | read as |
+|---|---:|---|
+| `cam0_test1` / `cam2_test1` | 1 | `ply 547` `54.7-9.21` — one ID across both cameras |
+| `cam0_test2` / `cam2_test2` | 1 | `ply 19` `4.7-135` — one ID across both cameras |
+| `cam0_test3` / `cam2_test3` | 2 | `ply 19` `4.1-15` and `ply ?` `4.7-135` — the two cameras read the roll differently, so they stay separate records |
 
-The pair-1 roll appears to be a test roll genuinely absent from the list. If it
-should be there, adding the row will let the system identify it.
+The digits are wrong — `99` reads as `19`, `17.5` as `135` — and they are
+reported wrong, which is the point. The earlier version matched these against
+the packing list and printed ply 99, which looked far better and told you
+nothing about what the camera could actually see.
+
+Pair 3 shows the cost of the change honestly: without a list to force the two
+readings together, two disagreeing reads of one roll stay two records. The
+fixes for that are better recognition or a calibrated overlap zone, not a
+lookup.
 
 ## Known limitations
 
-- **Read values are frequently wrong even when the roll is identified** — see
-  finding 3. Identification is reliable; transcription is not. Treat
-  `value_mismatch` rows as "identified, values unverified".
+- **Read values are frequently wrong** — see finding 3. The output is what the
+  camera read, so a wrong read is reported as a wrong read rather than
+  smoothed over. `tools/compare_to_master.py` will tell you how often, after
+  the fact.
 - **A roll clipped by the frame edge often loses its ply line**, which is why
   the length pair is used as a second route in.
-- **A poor enough read is reported as its own unidentified roll** rather than
-  merged into the right one (pair 2 above). Raising `ocr.min_votes` trades
-  recall for fewer of these; lowering the fuzzy-match threshold in
-  `master.best_match` does the opposite and risks false identifications.
+- **Two disagreeing reads of one roll stay two records** (pair 3 above), since
+  nothing outside the image is consulted to reconcile them. Raising
+  `ocr.min_votes` trades recall for steadier readings; calibrating the overlap
+  zones links the two views before either has been read.
 - **The overlap zones are unset by default**, so step 4 above (linking before
   the writing is read) is inactive until you calibrate them; linking then falls
   back to step 5, which only fires once a roll has been read. Calibrate on site

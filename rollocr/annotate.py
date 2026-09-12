@@ -1,10 +1,12 @@
 """On-screen annotation for the live view.
 
-Colour carries the state so it reads at a glance from across the room:
-grey while a roll is still being read, green once the values match the master
-list, amber when they were read but disagree with it, blue when the ply is not
-in the list at all. A disagreement is never hidden or corrected on screen -
-the numbers shown are always the ones read off the roll.
+Shows the marking in the format it is written in: the ply number, then the
+lengths as ``start-end``. Colour carries the state so it reads at a glance
+across a room -- grey while still reading, green once both lines have been
+read, amber when only the lengths came through and the ply line did not.
+
+Nothing here is checked against the packing list, so nothing on screen is ever
+corrected towards an expected value. The numbers drawn are the numbers read.
 """
 
 from __future__ import annotations
@@ -12,10 +14,9 @@ from __future__ import annotations
 import cv2
 
 STATUS_COLOURS = {
-    "pending": (170, 170, 170),          # still reading
-    "match": (80, 200, 90),              # read values equal the master row
-    "value_mismatch": (40, 170, 250),    # identified, but the read disagrees
-    "unidentified": (230, 160, 60),      # nothing in the list resembles this
+    "pending": (170, 170, 170),   # still reading
+    "read": (80, 200, 90),        # ply and lengths both read
+    "partial": (40, 170, 250),    # lengths read, ply line not legible
 }
 FONT = cv2.FONT_HERSHEY_SIMPLEX
 
@@ -50,18 +51,15 @@ def draw_tracks(frame, tracks, registry, camera: str):
         global_id = roll.global_id if roll else "tracking"
         _label(frame, global_id, (x0, max(16, y0 - 26)), colour, 0.6, 2)
 
+        # The marking as written: ply on top, lengths as start-end below.
         ply = track.confirmed_ply or _leading(track.ply_votes)
         if track.confirmed_range:
-            values = "{} - {}".format(*track.confirmed_range)
+            values = "{}-{}".format(*track.confirmed_range)
         else:
             leader = _leading(track.range_votes)
-            values = "{} - {}".format(*leader) if leader else "..."
-        _label(frame, "ply {}   {}".format(ply or "?", values), (x0, max(32, y0 - 6)), colour)
-
-        if roll and roll.status == "value_mismatch":
-            _label(frame, "list: {} - {}".format(roll.expected_start, roll.expected_end),
-                   (x0, min(frame.shape[0] - 4, y1 + 18)),
-                   STATUS_COLOURS["value_mismatch"], 0.45)
+            values = "{}-{}".format(*leader) if leader else "..."
+        _label(frame, "ply {}".format(ply or "?"), (x0, max(32, y0 - 6)), colour)
+        _label(frame, values, (x0, min(frame.shape[0] - 4, y1 + 18)), colour, 0.55)
     return frame
 
 

@@ -10,11 +10,12 @@ resolved by constraint:
   * both values fall inside the plant's range (< 100 m),
   * the end reading exceeds the start reading.
 
-Against the supplied master list those three rules leave exactly one legal
-reading for 53 of 54 rows, and never discard the true one.  The last row is
-settled by checking the ply number's own master entry -- see ``master.py``.
-Note that the digits themselves always come from OCR; the master list only ever
-chooses between readings, it never supplies a value.
+Measured against the 54 rows of a real packing list, those rules leave exactly
+one legal reading for 53 of them and never discard the true one. The remaining
+row ("5.9"/"16", which could equally read "5"/"9.16") stays genuinely
+ambiguous, and the best-ranked candidate is taken. That is deliberate: the
+packing list is not consulted to break the tie, because a pipeline that
+resolves its answer against the expected answer verifies nothing.
 """
 
 from __future__ import annotations
@@ -94,8 +95,8 @@ def in_range(text: str, cfg) -> bool:
 
     OCR drops faint decimal points, so a true 17.5 arrives as "175" or "135".
     Rejecting those outright reported nothing at all for the roll; ranking them
-    last keeps the digits available, and the master-list match can still
-    identify the roll from them.
+    last keeps the digits, so the roll is still reported with what was actually
+    read rather than silently dropped.
     """
     try:
         value = float(text)
@@ -123,8 +124,9 @@ def _split_groups(groups: list[str], cfg, explicit: bool) -> list[RangeReading]:
 def parse_range(text: str, cfg) -> list[RangeReading]:
     """All readings of the lower line, best first.
 
-    Returns a list because the split is genuinely ambiguous for some values;
-    the caller narrows it with the ply number's master entry.
+    Returns a list because a few values split ambiguously. The caller takes the
+    first: it is ranked by the constraints above, and nothing outside the image
+    is consulted to choose between them.
     """
     cleaned = normalise(text)
     if not cleaned:
