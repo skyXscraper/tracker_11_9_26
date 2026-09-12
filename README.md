@@ -6,11 +6,22 @@ cameras, tracks each roll, reads the red handwriting on it (ply number on top,
 views. Runs on a Raspberry Pi 5 (2 GB); tested offline against recordings from
 the cameras that will be deployed.
 
+One script takes any source — a still image, one or two recordings, or one or
+two live cameras:
+
 ```
-python run.py --cam1 videos/cam0_test1.mp4 --cam2 videos/cam2_test1.mp4   # offline
-python run.py --cam1 /dev/video0 --cam2 /dev/video2 --no-display          # on the Pi
-python -m pytest tests/ -q                                                # 60 tests
+python run.py photo.jpg                                    # a single image
+python run.py videos/cam0_test3.mp4                        # one recording
+python run.py videos/cam0_test3.mp4 videos/cam2_test3.mp4  # two recordings
+python run.py /dev/video0                                  # one live camera
+python run.py /dev/video0 /dev/video2 --no-display         # both, headless
+python -m pytest tests/ -q                                 # 60 tests
 ```
+
+A source is a camera when it is a device index or `/dev/videoN`, an image when
+it has an image extension, and a recording otherwise. With two sources they are
+tracked as two views of one work area, so a roll carried from one into the other
+keeps a single ID.
 
 ---
 
@@ -136,6 +147,10 @@ data-collection task, not a code change.
 | `pipeline.py` | when it is worth spending an OCR call |
 | `logio.py` | JSONL audit trail + CSV summary, both UTF-8 |
 | `hailo_ocr.py` | optional PP-OCRv5 recognition on a Hailo NPU |
+
+Tools, all inside this repo: `tools/batch_videos.py` (a whole folder of clips),
+`tools/compare_to_master.py` (opt-in comparison after a run),
+`tools/calibrate_roi.py`, `tools/bench_ocr.py`, `tools/test_hailo.py`.
 
 ### Identity across the two cameras
 
@@ -309,6 +324,7 @@ python run.py --cam1 /dev/video0 --cam2 /dev/video2 --config config.json
 | flag | effect |
 |---|---|
 | `--config FILE` | JSON overriding any field in `rollocr/config.py` |
+| `--names A B` | names for the sources (default `cam1`, `cam2`) |
 | `--no-display` | headless (use on the Pi) |
 | `--record` | write an annotated video of both views |
 | `--realtime` | pace video files at their own frame rate, as a live rehearsal |

@@ -1,16 +1,22 @@
 #!/usr/bin/env python3
-"""Two-camera sheet-roll tracking and handwriting OCR.
+"""Sheet-roll tracking and handwriting OCR. One script, any source.
 
-Live on the Pi:
+Give it one or two sources -- a still image, recorded video, or a live camera:
 
-    python run.py --cam1 /dev/video0 --cam2 /dev/video2
+    python run.py photo.jpg                             # a single image
+    python run.py videos/cam0_test3.mp4                 # one recording
+    python run.py videos/cam0_test3.mp4 videos/cam2_test3.mp4
+    python run.py /dev/video0                           # one live camera
+    python run.py /dev/video0 /dev/video2               # both cameras
 
-Offline against the recordings, which is how the pipeline is meant to be
-tuned before it goes near the plant:
+A source is a camera when it is a device index or a /dev/videoN path, an image
+when it has an image extension, and a recording otherwise. Two sources are
+tracked as two views of the same work area, so a roll carried from one into
+the other keeps a single ID.
 
-    python run.py --cam1 videos/cam0_test1.mp4 --cam2 videos/cam2_test1.mp4
-
-The same code path serves both; only the frame source differs.
+Output is what OCR read, in the format the marking is written in: the ply
+number, then the lengths as start-end. Nothing is checked against or corrected
+towards a packing list.
 """
 
 from __future__ import annotations
@@ -21,23 +27,33 @@ import time
 
 import cv2
 
+from pathlib import Path
+
 from rollocr import annotate
 from rollocr.config import Config
+from rollocr.detect import RollDetector
 from rollocr.logio import ResultLog
 from rollocr.ocr import OcrEngine, OcrWorker, SyncOcrRunner
 from rollocr.parse import parse_lines
-from rollocr.pipeline import CameraPipeline
+from rollocr.pipeline import CameraPipeline, writing_crop
 from rollocr.identity import RollRegistry
 from rollocr.sources import open_source
+
+
+IMAGE_SUFFIXES = {".jpg", ".jpeg", ".png", ".bmp", ".webp", ".tif", ".tiff"}
+
+
+def is_image(spec: str) -> bool:
+    return Path(spec).suffix.lower() in IMAGE_SUFFIXES
 
 
 def build_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__,
                                      formatter_class=argparse.RawDescriptionHelpFormatter)
-    parser.add_argument("--cam1", required=True, help="device index, /dev/videoN, or a video file")
-    parser.add_argument("--cam2", required=True, help="device index, /dev/videoN, or a video file")
-    parser.add_argument("--name1", default="cam1")
-    parser.add_argument("--name2", default="cam2")
+    parser.add_argument("sources", nargs="+",
+                        help="one or two of: image file, video file, device index, /dev/videoN")
+    parser.add_argument("--names", nargs="+", default=None,
+                        help="names for the sources (default cam1, cam2)")
     parser.add_argument("--config", help="JSON file overriding any config field")
     parser.add_argument("--output", help="output directory")
     parser.add_argument("--no-display", action="store_true", help="headless (use on the Pi)")
@@ -59,6 +75,8 @@ def main() -> int:
             pass
 
     args = build_args()
+    if len(args.sources) > 2:
+        raise SystemExit("at most two sources; got {}".format(len(args.sources)))
     cfg = Config.load(args.config)
     if args.output:
         cfg.output.dir = args.output
@@ -67,11 +85,22 @@ def main() -> int:
     if args.record:
         cfg.output.record = True
 
+    names = args.names or ["cam1", "cam2"]
+    if len(names) < len(args.sources):
+        names = names + [f"cam{i}" for i in range(len(names) + 1, len(args.sources) + 1)]
+
+    # A still image has no motion to track and no frames to vote over, so it
+    # takes a direct read rather than the streaming pipeline.
+    if any(is_image(spec) for spec in args.sources):
+        if len(args.sources) > 1:
+            raise SystemExit("give one image at a time")
+        return run_image(args.sources[0], cfg)
+
     # No packing list is loaded: the pipeline reports what OCR read and
     # nothing else. Compare a finished run against the list afterwards with
     # tools/compare_to_master.py, where both columns stay visible.
     pipelines = {}
-    for spec, name in ((args.cam1, args.name1), (args.cam2, args.name2)):
+    for spec, name in zip(args.sources, names):
         source = open_source(spec, name, cfg.capture, realtime=args.realtime)
         pipelines[name] = CameraPipeline(name, source, cfg)
         print(f"[init] {name}: {spec} -> {source.size[0]}x{source.size[1]}")
@@ -165,6 +194,53 @@ def main() -> int:
         log.close()
 
     summarise(registry, log, worker, started, confirmed_count)
+    return 0
+
+
+def run_image(path: str, cfg) -> int:
+    """Read one still image: detect the markings, OCR each, print what it says.
+
+    No tracking and no multi-frame voting -- there is only one frame, so the
+    reading stands on its own. Useful for checking the OCR end of the pipeline
+    without a camera or a recording.
+    """
+    image = cv2.imread(path)
+    if image is None:
+        raise SystemExit(f"cannot read image: {path}")
+    height, width = image.shape[:2]
+    print(f"[image] {path} -> {width}x{height}")
+
+    detector = RollDetector(cfg.detect, (width, height))
+    engine = OcrEngine(cfg.ocr, cfg.detect)
+    detections = detector.detect(image)
+    print(f"[image] markings found: {len(detections)}")
+
+    canvas = image.copy()
+    found = 0
+    for index, detection in enumerate(detections, 1):
+        crop = writing_crop(image, detection.writing_bbox)
+        if crop is None or crop.size == 0:
+            continue
+        lines = engine.read(crop)
+        ply, readings = parse_lines(lines, cfg.values)
+        raw = [text for text, _, _ in lines]
+        if not lines:
+            print(f"  [{index}] {detection.writing_bbox}  nothing read")
+            continue
+        found += 1
+        values = f"{readings[0].start}-{readings[0].end}" if readings else "?"
+        print(f"  [{index}] ply {ply or '?':<6} {values:<18} raw={raw}")
+
+        x0, y0, x1, y1 = detection.writing_bbox
+        cv2.rectangle(canvas, (x0, y0), (x1, y1), (80, 200, 90), 2)
+        cv2.putText(canvas, f"ply {ply or '?'}  {values}", (x0, max(18, y0 - 8)),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.6, (80, 200, 90), 2, cv2.LINE_AA)
+
+    out_dir = Path(cfg.output.dir)
+    out_dir.mkdir(parents=True, exist_ok=True)
+    out_path = out_dir / (Path(path).stem + "_annotated.jpg")
+    cv2.imwrite(str(out_path), canvas)
+    print(f"[image] {found} marking(s) read; annotated -> {out_path}")
     return 0
 
 
