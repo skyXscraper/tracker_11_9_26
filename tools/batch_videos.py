@@ -190,7 +190,7 @@ def main() -> int:
         raise SystemExit(f"no videos found under {dataset}")
 
     cfg = Config.load(args.config)
-    engine = OcrEngine(cfg.ocr, cfg.detect)   # one engine shared by every clip
+    engine = OcrEngine(cfg.ocr, cfg.detect, cfg.exposure)   # one engine shared by every clip
 
     print(f"[batch] {len(videos)} clips, OCR-only (no packing list)")
     rows = []

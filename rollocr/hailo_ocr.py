@@ -49,7 +49,7 @@ def split_text_lines(crop: np.ndarray, cfg_detect, max_lines: int = 3) -> list[t
     mask horizontally, smoothing the projection, and then merging bands that
     sit closer together than a line is tall keeps one line as one band.
     """
-    mask = ink_mask(crop, cfg_detect)
+    mask = ink_mask(crop, cfg_detect, for_crop=True)
     if mask is None or not mask.any():
         return []
 
@@ -87,8 +87,16 @@ def split_text_lines(crop: np.ndarray, cfg_detect, max_lines: int = 3) -> list[t
         else:
             groups.append([stroke])
 
-    bands = []
+    # Chaining by neighbouring gaps lets a single stray stroke in the space
+    # between two lines -- a shadow on the wrap, a scrap of crinkle -- bridge
+    # them into one band. A band far taller than a line of text cannot be one
+    # line, so split it where its strokes are furthest apart.
+    split_groups: list[list[dict]] = []
     for group in groups:
+        split_groups.extend(_split_over_tall(group, typical))
+
+    bands = []
+    for group in split_groups:
         # A written line is several glyphs side by side. Strokes stacked on
         # the same column are one glyph (or one stain), not a line of text.
         if _distinct_glyphs(group) < 2:
@@ -106,6 +114,39 @@ def split_text_lines(crop: np.ndarray, cfg_detect, max_lines: int = 3) -> list[t
     kept = [b for b in bands if b["ink"] >= strongest * 0.15]
     kept.sort(key=lambda b: -b["ink"])
     return sorted((b["top"], b["bottom"]) for b in kept[:max_lines])
+
+
+def _split_over_tall(group: list[dict], typical: float) -> list[list[dict]]:
+    """Break a band that spans more than one line of text at its widest gap.
+
+    Recursive, so three welded lines come apart too. A band short enough to be
+    a single line, or with no gap worth the name, is returned unchanged -- a
+    genuine line of handwriting has uneven stroke heights and must not be cut.
+    """
+    top = min(s["top"] for s in group)
+    bottom = max(s["bottom"] for s in group)
+    if (bottom - top) <= typical * 1.8 or len(group) < 4:
+        return [group]
+
+    ordered = sorted(group, key=lambda s: s["cy"])
+    gaps = [(ordered[i + 1]["cy"] - ordered[i]["cy"], i) for i in range(len(ordered) - 1)]
+    widest, at = max(gaps)
+    if widest < typical * 0.35:
+        return [group]
+
+    upper, lower = ordered[:at + 1], ordered[at + 1:]
+    # Two genuine lines overlap only slightly -- the writing is slanted, so the
+    # ply's lowest stroke can dip past the lengths' highest (18% on a real
+    # crop). One line wrongly cut in two overlaps itself heavily instead, since
+    # its tall and short digits sit side by side (35% on a real crop).
+    u_top, u_bot = min(s["top"] for s in upper), max(s["bottom"] for s in upper)
+    l_top, l_bot = min(s["top"] for s in lower), max(s["bottom"] for s in lower)
+    overlap = max(0, min(u_bot, l_bot) - max(u_top, l_top))
+    smaller = max(1, min(u_bot - u_top, l_bot - l_top))
+    if overlap / smaller > 0.28:
+        return [group]
+
+    return _split_over_tall(upper, typical) + _split_over_tall(lower, typical)
 
 
 def _distinct_glyphs(group: list[dict]) -> int:
@@ -171,9 +212,10 @@ class HailoRecognizer:
     OCR worker, so inference is serialised here exactly as the CPU engine is.
     """
 
-    def __init__(self, cfg, cfg_detect) -> None:
+    def __init__(self, cfg, cfg_detect, cfg_exposure=None) -> None:
         self.cfg = cfg
         self.cfg_detect = cfg_detect
+        self.cfg_exposure = cfg_exposure
         self.charset = load_charset(cfg.hailo_charset)
         self._lock = threading.Lock()
         self._ready = False
@@ -231,8 +273,8 @@ class HailoRecognizer:
         if self.cfg.deskew:
             work = rotate(crop, deskew_angle(crop, self.cfg_detect))
 
-        # Line bands must come from the colour image -- the ink mask keys on
-        # the red hue, which enhancement deliberately flattens away.
+        # Line bands must come from the colour image -- the ink mask uses each
+        # pen's colour, which the mono enhancement below deliberately removes.
         bands = split_text_lines(work, self.cfg_detect)
         if not bands:
             bands = [(0, work.shape[0] - 1)]
@@ -242,7 +284,8 @@ class HailoRecognizer:
         # why the network returned blank for every timestep. Darkening the
         # strokes in proportion to their redness is the same enhancement the
         # CPU path uses, and it is what makes the crop legible to the model.
-        source = soft_ink(work) if self.cfg.hailo_enhance else work
+        source = (soft_ink(work, self.cfg_detect, self.cfg_exposure)
+                  if self.cfg.hailo_enhance else work)
 
         prepared, centres = [], []
         for top, bottom in bands:

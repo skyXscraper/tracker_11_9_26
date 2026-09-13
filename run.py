@@ -136,7 +136,7 @@ def main() -> int:
     offline = all(hasattr(p.source, "fps") for p in pipelines.values()) and not args.realtime
     use_media_clock = offline
 
-    engine = OcrEngine(cfg.ocr, cfg.detect)
+    engine = OcrEngine(cfg.ocr, cfg.detect, cfg.exposure)
     # Offline: read every crop inline so a tuning run is complete and repeatable.
     # Live: a background thread with a bounded queue, so a slow read never
     # stalls capture and never grows memory behind a roll that has left.
@@ -235,8 +235,8 @@ def run_image(path: str, cfg) -> int:
     height, width = image.shape[:2]
     print(f"[image] {path} -> {width}x{height}")
 
-    detector = RollDetector(cfg.detect, (width, height))
-    engine = OcrEngine(cfg.ocr, cfg.detect)
+    detector = RollDetector(cfg.detect, (width, height), cfg.exposure)
+    engine = OcrEngine(cfg.ocr, cfg.detect, cfg.exposure)
     detections = detector.detect(image)
     print(f"[image] markings found: {len(detections)}")
 

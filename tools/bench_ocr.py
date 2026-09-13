@@ -73,8 +73,8 @@ def main() -> int:
     width = int(capture.get(cv2.CAP_PROP_FRAME_WIDTH))
     height = int(capture.get(cv2.CAP_PROP_FRAME_HEIGHT))
 
-    detector = RollDetector(cfg.detect, (width, height))
-    engine = OcrEngine(cfg.ocr, cfg.detect)
+    detector = RollDetector(cfg.detect, (width, height), cfg.exposure)
+    engine = OcrEngine(cfg.ocr, cfg.detect, cfg.exposure)
 
     print(f"[bench] {args.video}  {width}x{height}  ocr threads={cfg.ocr.num_threads}")
     baseline = resident_mb()

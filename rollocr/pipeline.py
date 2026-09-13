@@ -48,7 +48,7 @@ class CameraPipeline:
         self.source = source
         self.cfg = cfg
         self.frame_size = source.size
-        self.detector = RollDetector(cfg.detect, self.frame_size)
+        self.detector = RollDetector(cfg.detect, self.frame_size, cfg.exposure)
         self.tracker = Tracker(name, cfg.track, self.frame_size)
 
         self.frame_index = 0

@@ -1,18 +1,33 @@
-"""Finding rolls by the one thing that is unique to them: the red marking.
+"""Finding rolls by their handwritten marking, in any colour of ink.
 
-Two facts from the test footage drive this module.
+Two detectors live here, chosen by `detect.ink_mode`.
 
-1.  The ink photographs *pale magenta*, not deep red.  Through the glossy wrap
-    a stroke measures roughly H=170, S=40-80, with red-excess of only 25-45 --
-    far weaker than a naive "red" gate expects.
+**"any" (the default)** finds pen strokes whatever colour the pen was. A marking
+on a white wrap stands out in one of two ways, and the detector accepts either:
 
-2.  Human skin is the dangerous false positive, and it sits on the *opposite*
-    side of the hue wheel (H~11, orange-red) with *higher* saturation than the
-    ink.  Gating on the magenta side therefore separates ink from operators
-    cleanly, which a plain 0-12 hue band does not -- that band locks onto faces.
+  * it is *darker* than the wrap -- black, dark blue, most pens. Found with a
+    morphological black-hat on lightness, which responds to thin dark features
+    and ignores large dark regions such as a forearm or the floor.
+  * it is *more colourful* than the wrap -- red, green, pale blue. Pale ink can
+    be barely darker than glossy wrap, so lightness alone misses it; chroma (the
+    distance from neutral grey) catches it. Passed through a top-hat, so again
+    only thin coloured features count, not a whole hand.
 
-Everything else (desks, floor stains, cardboard) is rejected by requiring
-several ink strokes grouped together over a bright roll body.
+Both are then restricted to strokes sitting on a bright, near-neutral surface,
+which is what rejects cables, machinery and clothing.
+
+Measured on real frames against the red-only detector it replaced: both found
+every real marking (3/3), but "any" produced roughly twice the false candidates
+on factory clutter (12 against 5 over 8 frames). Red is rare in a factory, so a
+red-only gate is naturally more selective. Most of those extras are discarded
+downstream -- by the tracker's hit count, the motion filter, OCR ranking and
+voting -- but they are real, which is why the red detector is kept.
+
+**"red"** is the original detector, for sites that only ever use a red pen and
+want its extra selectivity. Tuned on real footage: through the glossy wrap red
+ink photographs *pale magenta* (H~170, S 40-80), while skin -- the dangerous
+false positive -- sits on the orange side of the hue wheel at higher saturation,
+so gating on the magenta side separates the two.
 """
 
 from __future__ import annotations
@@ -41,7 +56,68 @@ class Detection:
         return self.writing_bbox[3] - self.writing_bbox[1]
 
 
-def ink_mask(bgr: np.ndarray, cfg) -> np.ndarray:
+def ink_mask(bgr: np.ndarray, cfg, for_crop: bool = False) -> np.ndarray:
+    """Binary mask of pen strokes, in whichever mode the site is configured for.
+
+    ``for_crop`` matters because stroke width does: detection runs on a
+    downscaled whole frame, where a pen stroke is a couple of pixels wide, while
+    OCR works on full-resolution crops where it is several times wider.
+    """
+    if getattr(cfg, "ink_mode", "any") == "red":
+        return red_ink_mask(bgr, cfg)
+    return any_ink_mask(bgr, cfg, for_crop)
+
+
+def ink_weight(bgr: np.ndarray, cfg, for_crop: bool = True) -> np.ndarray:
+    """Continuous ink strength in [0, 1], for darkening strokes before OCR.
+
+    The mask says where ink is; this says how strongly, so enhancement can
+    deepen a faint stroke more than the surface around it without the ragged
+    edges a hard threshold would leave.
+    """
+    if getattr(cfg, "ink_mode", "any") == "red":
+        blue, green, red = (bgr[:, :, i].astype(np.float32) for i in range(3))
+        return np.clip((red - np.maximum(green, blue)) / 45.0, 0.0, 1.0)
+
+    dark, colour = _stroke_responses(bgr, cfg, for_crop)
+    dark_w = np.clip(dark / max(cfg.dark_ink_min * 2.0, 1.0), 0.0, 1.0)
+    colour_w = np.clip(colour / max(cfg.colour_ink_min * 2.0, 1.0), 0.0, 1.0)
+    return np.maximum(dark_w, colour_w)
+
+
+def _stroke_responses(bgr: np.ndarray, cfg, for_crop: bool = False) -> tuple[np.ndarray, np.ndarray]:
+    """How strongly each pixel reads as a thin dark stroke, and as a thin coloured one."""
+    lab = cv2.cvtColor(bgr, cv2.COLOR_BGR2LAB).astype(np.float32)
+    lightness = lab[:, :, 0]
+    chroma = np.sqrt((lab[:, :, 1] - 128.0) ** 2 + (lab[:, :, 2] - 128.0) ** 2)
+
+    # The kernel must be wider than a pen stroke and narrower than a hand.
+    divisor = cfg.crop_stroke_kernel_div if for_crop else cfg.stroke_kernel_div
+    size = max(5, (min(lightness.shape[:2]) // divisor) | 1)
+    kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (size, size))
+    dark = cv2.morphologyEx(lightness, cv2.MORPH_BLACKHAT, kernel)
+    colour = cv2.morphologyEx(chroma, cv2.MORPH_TOPHAT, kernel)
+    return dark, colour
+
+
+def any_ink_mask(bgr: np.ndarray, cfg, for_crop: bool = False) -> np.ndarray:
+    """Pen strokes of any colour: thin and either darker or more colourful than
+    the wrap, and sitting on a bright near-neutral surface."""
+    dark, colour = _stroke_responses(bgr, cfg, for_crop)
+    strokes = (dark > cfg.dark_ink_min) | (colour > cfg.colour_ink_min)
+
+    hsv = cv2.cvtColor(bgr, cv2.COLOR_BGR2HSV)
+    surface = cv2.inRange(hsv, (0, 0, cfg.surface_val_min), (180, cfg.surface_sat_max, 255))
+    surface = cv2.morphologyEx(surface, cv2.MORPH_CLOSE, np.ones((7, 7), np.uint8))
+    # Grown so strokes near the edge of the wrap, which break its brightness,
+    # still count as being on it.
+    grow = max(3, cfg.surface_grow)
+    surface = cv2.dilate(surface, np.ones((grow, grow), np.uint8))
+
+    return (strokes & (surface > 0)).astype(np.uint8) * 255
+
+
+def red_ink_mask(bgr: np.ndarray, cfg) -> np.ndarray:
     """Binary mask of red pen strokes, built to exclude skin."""
     hsv = cv2.cvtColor(bgr, cv2.COLOR_BGR2HSV)
 
@@ -84,8 +160,9 @@ def sharpness(gray: np.ndarray) -> float:
 
 
 class RollDetector:
-    def __init__(self, cfg, frame_size: tuple[int, int]) -> None:
+    def __init__(self, cfg, frame_size: tuple[int, int], exposure_cfg=None) -> None:
         self.cfg = cfg
+        self.exposure_cfg = exposure_cfg
         self.frame_w, self.frame_h = frame_size
         # Anisotropic on purpose: writing runs horizontally, and the two
         # written lines sit close together vertically.  A square kernel big
@@ -107,6 +184,11 @@ class RollDetector:
         cfg = self.cfg
         scale = cfg.scale
         small = cv2.resize(frame, None, fx=scale, fy=scale, interpolation=cv2.INTER_AREA)
+        # On the downscaled copy, so correcting a blown-out frame costs little.
+        # Faint ink on an overexposed roll is not found at all without it.
+        if self.exposure_cfg is not None and self.exposure_cfg.correct_detection:
+            from .exposure import correct_exposure
+            small = correct_exposure(small, self.exposure_cfg)
 
         strokes_mask = ink_mask(small, cfg)
         strokes_mask = cv2.morphologyEx(strokes_mask, cv2.MORPH_CLOSE, self._close_kernel)
@@ -135,6 +217,20 @@ class RollDetector:
             if tight is None:
                 continue
             tx, ty, tw, th = tight
+
+            # A real marking is two short lines of strokes: compact and dense.
+            # Scattered clutter joined by the grouping step is neither, and
+            # without these two checks it was handed to OCR as crops averaging
+            # 442,000 px -- 37x a real marking -- which made every read slow
+            # and every result garbage. Measured on real frames: no real
+            # marking exceeded 2.7% of the frame, while clutter groups reached
+            # the entire frame.
+            frame_fraction = (tw * th) / float(small.shape[0] * small.shape[1])
+            if frame_fraction > cfg.max_writing_fraction:
+                continue
+            density = int((strokes_mask[ty:ty + th, tx:tx + tw] > 0).sum()) / max(tw * th, 1)
+            if density < cfg.min_writing_density:
+                continue
 
             # Back to full resolution.
             wx0, wy0 = int(tx / scale), int(ty / scale)

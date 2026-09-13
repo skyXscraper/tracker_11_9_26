@@ -71,7 +71,38 @@ class CameraSource(FrameSource):
             cap.set(cv2.CAP_PROP_BUFFERSIZE, cfg.buffer_size)
         except cv2.error:
             pass
+        CameraSource._apply_exposure(cap, cfg)
         return cap
+
+    @staticmethod
+    def _apply_exposure(cap, cfg) -> None:
+        """Lower exposure at the sensor, before a bright roll clips to white.
+
+        This is the only overexposure fix that works on a blown-out wrap: a
+        highlight that has clipped has lost its detail, and no processing after
+        capture recovers it. Each setting is applied only when configured, so an
+        unconfigured camera keeps whatever it was doing.
+
+        V4L2 encodes auto-exposure oddly -- through OpenCV, 1 selects manual and
+        3 selects aperture-priority auto -- and a manual exposure value is ignored
+        until auto is switched off, so the mode is set first.
+        """
+        if cfg.auto_exposure is not None:
+            mode = 3 if cfg.auto_exposure else 1
+            if not cap.set(cv2.CAP_PROP_AUTO_EXPOSURE, mode):
+                # Some drivers use 0.75 / 0.25 for the same two modes.
+                cap.set(cv2.CAP_PROP_AUTO_EXPOSURE, 0.75 if cfg.auto_exposure else 0.25)
+
+        for name, prop in (("exposure", cv2.CAP_PROP_EXPOSURE),
+                           ("brightness", cv2.CAP_PROP_BRIGHTNESS),
+                           ("gain", cv2.CAP_PROP_GAIN)):
+            value = getattr(cfg, name, None)
+            if value is None:
+                continue
+            accepted = cap.set(prop, float(value))
+            actual = cap.get(prop)
+            note = "" if accepted else "  (driver refused it)"
+            print(f"[camera] {name} -> requested {value}, now {actual}{note}")
 
     def _loop(self) -> None:
         while not self._stop.is_set():

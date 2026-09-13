@@ -29,7 +29,8 @@ from dataclasses import dataclass
 import cv2
 import numpy as np
 
-from .detect import ink_mask
+from .detect import ink_mask, ink_weight
+from .exposure import correct_exposure
 
 
 @dataclass
@@ -50,23 +51,43 @@ class OcrResult:
     timestamp: float
 
 
-def soft_ink(bgr: np.ndarray, strength: float = 0.75) -> np.ndarray:
-    """Darken red strokes proportionally to redness, preserving stroke shape.
+def soft_ink(bgr: np.ndarray, cfg_detect=None, exposure_cfg=None,
+             strength: float = 0.75) -> np.ndarray:
+    """A mono image with the ink deepened, whatever colour the pen was.
 
-    A hard mask turns anti-aliased handwriting into ragged blobs; this keeps the
-    gradient and simply deepens the contrast against the pale wrap.
+    Three steps, in order:
+
+    1. Exposure correction, so a washed-out roll has usable contrast again.
+       Lightness only, so each pen's colour survives for the next step.
+    2. Darken each pixel in proportion to how strongly it reads as ink -- darker
+       than the wrap, or more colourful than it. A hard mask would turn
+       anti-aliased handwriting into ragged blobs; a proportional weight keeps
+       the stroke shape and just deepens its contrast.
+    3. Return one channel. The recogniser reads digits without colour, and a
+       mono image removes any dependence on which pen was used.
+
+    Called without a detection config it falls back to the original red-only
+    weighting, so older callers keep their behaviour.
     """
-    blue, green, red = (bgr[:, :, i].astype(np.float32) for i in range(3))
-    excess = np.clip((red - np.maximum(green, blue)) / 45.0, 0.0, 1.0)
-    gray = cv2.cvtColor(bgr, cv2.COLOR_BGR2GRAY).astype(np.float32)
-    out = gray * (1.0 - strength * excess)
+    # The ink weight comes from the raw crop, where ink and wrap crinkle are
+    # best separated; correction would amplify the crinkle into the weight.
+    if cfg_detect is not None:
+        weight = ink_weight(bgr, cfg_detect, for_crop=True)
+    else:
+        blue, green, red = (bgr[:, :, i].astype(np.float32) for i in range(3))
+        weight = np.clip((red - np.maximum(green, blue)) / 45.0, 0.0, 1.0)
+
+    # The legible contrast comes from the corrected one.
+    work = correct_exposure(bgr, exposure_cfg) if exposure_cfg is not None else bgr
+    gray = cv2.cvtColor(work, cv2.COLOR_BGR2GRAY).astype(np.float32)
+    out = gray * (1.0 - strength * weight)
     out = cv2.normalize(out, None, 0, 255, cv2.NORM_MINMAX)
     return cv2.cvtColor(out.astype(np.uint8), cv2.COLOR_GRAY2BGR)
 
 
 def deskew_angle(crop: np.ndarray, cfg_detect) -> float:
     """Angle of the writing, from the ink's minimum-area rectangle."""
-    mask = ink_mask(crop, cfg_detect)
+    mask = ink_mask(crop, cfg_detect, for_crop=True)
     points = cv2.findNonZero(mask)
     if points is None or len(points) < 30:
         return 0.0
@@ -92,7 +113,7 @@ def rotate(img: np.ndarray, angle: float) -> np.ndarray:
 
 def scale_for_ocr(img: np.ndarray, reference: np.ndarray, cfg, cfg_detect) -> np.ndarray:
     """Scale so a text line stands about ``target_text_height`` pixels tall."""
-    mask = ink_mask(reference, cfg_detect)
+    mask = ink_mask(reference, cfg_detect, for_crop=True)
     ys, _ = np.where(mask > 0)
     # The marking is two stacked lines, so one line is about half its height.
     line_h = max((ys.max() - ys.min()) / 2.0, 8.0) if len(ys) else 25.0
@@ -107,9 +128,10 @@ def scale_for_ocr(img: np.ndarray, reference: np.ndarray, cfg, cfg_detect) -> np
 class OcrEngine:
     """Thin wrapper over RapidOCR, kept to one shared instance."""
 
-    def __init__(self, cfg, cfg_detect) -> None:
+    def __init__(self, cfg, cfg_detect, cfg_exposure=None) -> None:
         self.cfg = cfg
         self.cfg_detect = cfg_detect
+        self.cfg_exposure = cfg_exposure
         self._engine = None
         self._flavour = None
         self._hailo = None
@@ -125,7 +147,7 @@ class OcrEngine:
         """
         from .hailo_ocr import HailoRecognizer
         try:
-            recognizer = HailoRecognizer(self.cfg, self.cfg_detect)
+            recognizer = HailoRecognizer(self.cfg, self.cfg_detect, self.cfg_exposure)
             print("[ocr] backend: hailo (PP-OCRv5 recognition on NPU)")
             return recognizer
         except Exception as exc:
@@ -210,7 +232,7 @@ class OcrEngine:
             # rescaled image the CPU detector needs.
             return self._hailo.read(crop)
 
-        prepared = soft_ink(crop)
+        prepared = soft_ink(crop, self.cfg_detect, self.cfg_exposure)
         if self.cfg.deskew:
             angle = deskew_angle(crop, self.cfg_detect)
             prepared = rotate(prepared, angle)

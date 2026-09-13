@@ -140,7 +140,7 @@ def main() -> int:
 
     crop = image
     if args.detect:
-        detector = RollDetector(cfg.detect, (image.shape[1], image.shape[0]))
+        detector = RollDetector(cfg.detect, (image.shape[1], image.shape[0]), cfg.exposure)
         found = detector.detect(image)
         print(f"[test] detections: {len(found)}")
         if not found:
@@ -194,7 +194,7 @@ def main() -> int:
     try:
         from rollocr.ocr import OcrEngine
         cfg.ocr.backend = "rapidocr"
-        engine = OcrEngine(cfg.ocr, cfg.detect)
+        engine = OcrEngine(cfg.ocr, cfg.detect, cfg.exposure)
         lines = engine.read(crop)
         started = time.perf_counter()
         engine.read(crop)

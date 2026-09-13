@@ -34,31 +34,45 @@ def load(name: str):
 
 # -- splitting the two written lines ----------------------------------------
 
-def test_two_line_crop_splits_into_exactly_two_lines():
+@pytest.mark.parametrize("mode", ["red", "any"])
+def test_the_two_written_lines_are_never_welded_together(mode):
     """Regression: this crop first fragmented into five bands, then welded both
     written lines into one -- and a single-line recogniser fed two lines returns
     blank for every timestep.
 
-    The bands are ordered but NOT disjoint. The writing sits on a slanted,
-    curved cylinder, so the ply line's lowest stroke (y=130) hangs below the
-    length line's highest (y=123). Splitting is by stroke grouping rather than
-    by a row profile precisely because no horizontal cut separates them.
+    The ply "99" sits at rows ~86-130 and the lengths "4.7-17.5" at ~123-171.
+    They overlap in y because the writing is slanted on a curved roll, so the
+    check is that each real line lands in its own band, not that bands are
+    disjoint. Any-colour mode may add a band for the faint partial marking
+    along the wrap's top edge; that is real ink and must not count against it.
     """
-    bands = split_text_lines(load("roll_ply99.jpg"), CFG.detect)
-    assert len(bands) == 2, f"expected ply line + length line, got {bands}"
+    CFG.detect.ink_mode = mode
+    try:
+        bands = split_text_lines(load("roll_ply99.jpg"), CFG.detect)
+    finally:
+        CFG.detect.ink_mode = "any"
 
-    (top_a, bottom_a), (top_b, bottom_b) = bands
-    assert top_a < top_b, "bands must run top to bottom"
-    assert (bottom_a - top_a) >= 8 and (bottom_b - top_b) >= 8
-    # The lengths line is the one that identifies the roll; it must come
-    # through as its own band rather than merged with the ply above it.
-    assert top_b >= 100 and bottom_b >= 160
+    ply_band = [b for b in bands if b[0] <= 95 and b[1] >= 120]
+    length_band = [b for b in bands if b[0] >= 110 and b[1] >= 160]
+    assert ply_band, f"no band holds the ply line: {bands}"
+    assert length_band, f"no band holds the lengths line: {bands}"
+    welded = [b for b in bands if b[0] <= 95 and b[1] >= 160]
+    assert not welded, f"ply and lengths welded into one band: {bands}"
 
 
-def test_clipped_crop_yields_a_single_line():
-    """When the frame edge takes the ply line, only the lengths remain."""
-    bands = split_text_lines(load("roll_54p7.jpg"), CFG.detect)
-    assert len(bands) == 1
+@pytest.mark.parametrize("mode", ["red", "any"])
+def test_a_clipped_crop_keeps_its_lengths_line_whole(mode):
+    """When the frame edge takes the ply line, the lengths line ("54.7-9.2",
+    rows ~66-100) must survive as one band. Regression: an over-eager split of
+    tall bands cut this single line of uneven handwriting in two."""
+    CFG.detect.ink_mode = mode
+    try:
+        bands = split_text_lines(load("roll_54p7.jpg"), CFG.detect)
+    finally:
+        CFG.detect.ink_mode = "any"
+
+    whole = [b for b in bands if b[0] <= 70 and b[1] >= 95]
+    assert whole, f"lengths line was split or lost: {bands}"
 
 
 def test_split_never_returns_more_than_max_lines():

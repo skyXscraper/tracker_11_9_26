@@ -1,7 +1,7 @@
 # Sheet-roll tracking and handwriting OCR, two cameras
 
 Detects fibreglass sheet rolls as an operator carries them past two overlapping
-cameras, tracks each roll, reads the red handwriting on it (ply number on top,
+cameras, tracks each roll, reads the handwriting on it in any ink colour (ply number on top,
 `start - end` lengths below), and reports one stable ID per roll across both
 views. Runs on a Raspberry Pi 5 (2 GB); tested offline against recordings from
 the cameras that will be deployed.
@@ -15,7 +15,7 @@ python run.py videos/cam0_test3.mp4                        # one recording
 python run.py videos/cam0_test3.mp4 videos/cam2_test3.mp4  # two recordings
 python run.py /dev/video0                                  # one live camera
 python run.py /dev/video0 /dev/video2 --no-display         # both, headless
-python -m pytest tests/ -q                                 # 60 tests
+python -m pytest tests/ -q                                 # 86 tests
 ```
 
 A source is a camera when it is a device index or `/dev/videoN`, an image when
@@ -30,22 +30,83 @@ keeps a single ID.
 Three findings shaped the design more than any design decision did. They are
 worth reading before changing anything.
 
-### 1. The ink is pale magenta, not red
+### 1. Any colour of ink, and why that is harder than red
 
-Through the glossy wrap, a red pen stroke measures about **H=170, S=40-80**,
-with a red-excess (`R - max(G,B)`) of only **25-45**. A conventional "red" HSV
-gate — hue 0-12 with decent saturation — finds almost none of it.
+The detector finds pen strokes in **any colour** by default — black, blue, red,
+green. A marking on a white wrap stands out in one of two ways, and each is
+tested separately:
 
-Worse, that conventional gate locks onto **human skin**, which sits on the
-*opposite* side of the hue wheel (H≈11, orange-red) at *higher* saturation than
-the ink. The first working version of the detector confidently cropped the
-operator's face on every frame.
+- **darker than the wrap** (black, dark blue): a morphological black-hat on
+  lightness, which responds to thin dark features and ignores large dark
+  regions like a forearm or the floor;
+- **more colourful than the wrap** (red, green, pale blue): a top-hat on chroma.
+  Pale ink can be barely darker than glossy wrap, so lightness alone misses it.
 
-So detection gates the **magenta side only** (`hue_hi_min = 158`). The orange
-band is kept available but narrow and strict (`hue_lo_max = 6`), for deep-red
-ink under different lighting. If you change the pen or the lighting, this is
-the first thing to re-check — `tools/calibrate_roi.py` plus a few saved crops
-will tell you quickly.
+Red-only detection was easy because red is rare in a factory. "Any stroke on a
+bright surface" is not, and three problems had to be measured and fixed on real
+footage before it was usable:
+
+- **Wrap crinkle looks like black ink.** Glossy creases are thin, dark and
+  neutral — the same signature. At a naive threshold the detector found 3,633 px
+  of "ink" on a crop whose real writing was 752 px. The dark threshold (`70`) now
+  sits above the crinkle's 99th percentile; red ink overlaps crinkle in
+  lightness, which is fine, because the colour test catches it (colour
+  threshold `8`: ink ≥10, crinkle ≤7).
+- **Scattered clutter got grouped into giant "markings".** OCR was being handed
+  crops averaging 442,000 px — 37× a real marking — so reads were slow and
+  garbage. No real marking exceeded 2.7% of the frame, so groups larger than 6%
+  (or sparser than 0.05 density) are now rejected.
+- **Stray strokes bridged the two written lines** in the Hailo line splitter;
+  over-tall bands are now split at their widest gap, with an overlap check so a
+  single line of uneven handwriting is not cut in two.
+
+After those fixes both modes find every real marking tested (3/3), but
+any-colour is still measurably costlier and, on red ink, less accurate:
+
+| footage | mode | OCR calls | runtime | read |
+|---|---|---:|---:|---|
+| real red ink (truth: ply 99) | red | 262 | 58 s | **ply 99** `4.7-135` |
+| real red ink (truth: ply 99) | any | 585 | 143 s | ply 49 / 19, split in two |
+| plant clip, no writing | red | 89 | 27 s | — |
+| plant clip, no writing | any | 158 | 59 s | — |
+
+More detected candidates means more tracks competing for OCR time, and more
+chances for a misread to win the vote. **If your site only ever uses red pens,
+set `"detect": {"ink_mode": "red"}`** — about half the OCR load on the Pi, and
+it read this roll correctly where any-colour did not.
+
+**Validation limit:** the only real handwriting available was red. Black, blue
+and green were tested by recolouring those real strokes and on drawn text, not
+on real footage of those pens on the wrap. Record a few rolls in black and blue
+ink before relying on it.
+
+### Overexposure: fix it at the camera
+
+The white glossy wrap blows out under strong light. **Once a highlight clips to
+white its detail is gone** — on test frames lifted until ~80% was clipped, every
+enhancement tried (stretching, CLAHE, gamma, stroke darkening, alone and
+combined) still produced garbage. So the real fix is lowering exposure at the
+sensor, before it clips:
+
+```json
+{"capture": {"auto_exposure": false, "exposure": 150}}
+```
+
+Find the camera's range and current value first, then lower `exposure` until
+the roll is no longer blown out:
+
+```bash
+v4l2-ctl -d /dev/video0 --list-ctrls | grep -i exposure
+```
+
+Unset values leave the camera alone. The run prints what the driver accepted,
+since some cameras ignore these settings.
+
+Software correction still runs on everything the recogniser reads: a percentile
+stretch plus CLAHE on lightness only (so pen colour survives for detection),
+converted to a mono image. It helps a bright-but-unclipped roll, and on the
+real red footage it changed the result — that roll read as **ply 99** for the
+first time, where every earlier run had read `19`.
 
 ### 2. The separator between the two lengths is not consistent
 
@@ -85,13 +146,16 @@ The recognition model is trained on printed text. On this handwriting it makes
 4·7 - 17·5
 ```
 
-comes back as **`19`** and **`4.7-135`** — a looped 9 read as 1, a crossed 7 read
-as 3, and the faint decimal point dropped. That result was identical across
-every combination tried: raw crops, proportional ink darkening, hard
-binarisation, CLAHE, unsharp masking, and scale factors from 1.5× to 4×. Two
-things did help and are in the pipeline — cropping tight to the ink rather than
-to a dilated blob, and darkening strokes *proportionally to redness* instead of
-thresholding — but neither corrects the misreads above.
+came back as **`19`** and **`4.7-135`** — a looped 9 read as 1, a crossed 7 read
+as 3, and the faint decimal point dropped. That was identical across raw crops,
+hard binarisation, unsharp masking and scale factors from 1.5× to 4×.
+
+Exposure correction partly changed that. Stretching lightness and restoring
+local contrast before OCR made the ply line legible, and in red-only mode the
+roll now reads **ply 99** — correct, and reproducible across runs. The lengths
+line is not fixed: `17.5` still reads as `135`. So one of the two systematic
+misreads was a contrast problem; the crossed 7 appears to be a genuine limit of
+the recogniser.
 
 **What the system does about it: nothing.** It reports the reading. An earlier
 version scored the OCR'd digits against all 54 packing-list rows and adopted

@@ -20,6 +20,19 @@ class CaptureConfig:
     fourcc: str = "MJPG"             # essential: two raw YUYV streams saturate USB
     buffer_size: int = 1             # keep latency down; we always want the newest frame
 
+    # Camera exposure. The wrap is white and glossy and blows out under strong
+    # light, and once a highlight clips to white its detail is gone -- no amount
+    # of processing recovers it. Lowering exposure here is the only fix that
+    # works on a clipped roll. None leaves the camera's own setting untouched.
+    #   auto_exposure: False switches the camera to manual so `exposure` sticks.
+    #   exposure: device units. On V4L2 USB cameras this is usually 1-5000 in
+    #             100 us steps; start near 150 and lower it until the roll is no
+    #             longer blown out. Check the range with: v4l2-ctl -d /dev/video0 -l
+    auto_exposure: bool | None = None
+    exposure: float | None = None
+    brightness: float | None = None
+    gain: float | None = None
+
 
 @dataclass
 class DetectConfig:
@@ -40,6 +53,33 @@ class DetectConfig:
     hue_lo_max: int = 6          # set to 0 to disable the orange-side band
     red_excess_min: int = 12     # R - max(G, B); ink barely reaches 45 here
 
+    # Which pens to look for. "any" finds dark and coloured ink alike -- black,
+    # blue, red, green. "red" is the original red-only detector: more selective
+    # on factory clutter (about half the false candidates), so worth choosing
+    # at a site that only ever uses a red pen.
+    ink_mode: str = "any"
+
+    # "any" mode. A stroke counts if it is darker than the wrap by dark_ink_min,
+    # or more colourful than it by colour_ink_min, in LAB units, measured on the
+    # raw image. Set from real crops of ink on glossy wrap:
+    #   colour: ink median 10-15, wrap crinkle 99th percentile 5-7   -> 8
+    #   dark:   wrap crinkle 99th percentile 50-66, so the threshold sits above
+    #           it. Glossy creases are thin, dark and neutral -- the same
+    #           signature as black ink -- so a lower value turns the wrap itself
+    #           into "writing". Red ink is only moderately dark and overlaps the
+    #           crinkle here, which is fine: the colour test catches it instead.
+    dark_ink_min: float = 70.0
+    colour_ink_min: float = 8.0
+    # ...and it sits on a bright near-neutral surface, grown by surface_grow px.
+    surface_val_min: int = 150
+    surface_sat_max: int = 70
+    surface_grow: int = 15
+    # Stroke-detector kernel, as a fraction of the image's shorter side. Two,
+    # because a pen stroke is ~2 px wide on the downscaled detection frame and
+    # several times that on a full-resolution OCR crop.
+    stroke_kernel_div: int = 40
+    crop_stroke_kernel_div: int = 10
+
     # Stroke / text-line grouping (all in downscaled pixels).
     close_kernel: tuple[int, int] = (9, 3)
     min_stroke_area: int = 12
@@ -47,6 +87,14 @@ class DetectConfig:
     group_gap_y: int = 20        # kept smaller: only the two written lines should merge
     min_strokes: int = 2             # a real marking has several strokes
     min_group_area: int = 120
+
+    # A marking is compact and dense. Groups larger than this share of the
+    # frame, or sparser than this, are scattered clutter joined together by the
+    # grouping step rather than writing. Real markings measured 0.9-2.7% of the
+    # frame at density 0.07-0.18; clutter groups reached the whole frame. Raise
+    # max_writing_fraction if operators hold the roll very close to the lens.
+    max_writing_fraction: float = 0.06
+    min_writing_density: float = 0.05
 
     # Full-resolution sanity gates.
     min_text_height_px: int = 14     # below this PP-OCR recognition collapses
@@ -59,6 +107,31 @@ class DetectConfig:
 
     # Optional work zone, as fractions of the frame (x0, y0, x1, y1).
     roi: tuple[float, float, float, float] | None = None
+
+
+@dataclass
+class ExposureConfig:
+    """Software exposure correction, applied before detection and before OCR.
+
+    Helps a roll that is bright but not clipped, and recordings whose camera
+    setting can no longer be changed. It cannot restore a highlight that has
+    already clipped to white -- lower `capture.exposure` for that.
+    """
+
+    correct: bool = True
+    # Off by default: correction amplifies the wrap's crinkle along with the ink
+    # (its 99th-percentile stroke response roughly doubles), which inflates
+    # false detections. Correction still runs on what the recogniser reads.
+    correct_detection: bool = False
+    low_percentile: float = 1.0      # stretch from the darkest ink...
+    high_percentile: float = 99.5    # ...to the roll surface, ignoring glints
+    min_range: float = 8.0           # skip the stretch on an already-flat image
+    gamma: float = 1.0               # >1 pulls highlights down further
+    clahe_clip: float = 2.0          # local contrast restoration; 0 disables
+    clahe_grid: int = 8
+    # Hand the recogniser a single well-contrasted channel. It reads digits
+    # without colour, and mono removes any dependence on the pen used.
+    mono_for_ocr: bool = True
 
 
 @dataclass
@@ -167,6 +240,7 @@ class OutputConfig:
 class Config:
     capture: CaptureConfig = field(default_factory=CaptureConfig)
     detect: DetectConfig = field(default_factory=DetectConfig)
+    exposure: ExposureConfig = field(default_factory=ExposureConfig)
     track: TrackConfig = field(default_factory=TrackConfig)
     ocr: OcrConfig = field(default_factory=OcrConfig)
     values: ValueConfig = field(default_factory=ValueConfig)
