@@ -108,6 +108,9 @@ def draw_header(canvas, pipeline_fps: float, per_camera: dict, stats: dict):
                          for name, fps in sorted(per_camera.items()))
     detail = "{}   |   rolls {}   ocr {} ({} dropped)".format(
         cameras, stats.get("rolls", 0), stats.get("ocr", 0), stats.get("dropped", 0))
+    if stats.get("target"):
+        # Shown beside the measured rate so a slipping Pi is obvious at a glance.
+        detail = "target {:g}  late {}   |   ".format(stats["target"], stats.get("late", 0)) + detail
     cv2.putText(canvas, detail, (130, 23), FONT, 0.48, (225, 225, 225), 1, cv2.LINE_AA)
     return canvas
 

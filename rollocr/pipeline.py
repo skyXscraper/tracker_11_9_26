@@ -59,8 +59,16 @@ class CameraPipeline:
         self._fps_t0 = time.time()
         self._fps_n = 0
 
-    def read(self):
-        frame = self.source.read()
+    def read(self, media_t: float | None = None):
+        """Next frame; or, for a recording run at a fixed rate, the one due now.
+
+        A live camera always hands back its newest frame, so ``media_t`` only
+        changes anything for a file.
+        """
+        if media_t is not None and hasattr(self.source, "read_at"):
+            frame = self.source.read_at(media_t)
+        else:
+            frame = self.source.read()
         if frame is None:
             return None
         self.frame_index = frame.index

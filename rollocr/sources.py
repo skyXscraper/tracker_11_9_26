@@ -165,6 +165,22 @@ class VideoFileSource(FrameSource):
                 time.sleep(min(delay, 0.25))
         return Frame(img, self._count, media_t)
 
+    def read_at(self, media_t: float) -> Frame | None:
+        """The first frame at or after ``media_t`` seconds, skipping earlier ones.
+
+        Lets a 30 fps recording be run at a steady 15 fps: frames that fall
+        between ticks are grabbed without being decoded into an image, which is
+        far cheaper than reading and discarding them.
+        """
+        while True:
+            if not self._cap.grab():
+                return None
+            self._count += 1
+            timestamp = self._cap.get(cv2.CAP_PROP_POS_MSEC) / 1000.0
+            if timestamp + 1e-6 >= media_t:
+                ok, img = self._cap.retrieve()
+                return Frame(img, self._count, timestamp) if ok else None
+
     @property
     def fps(self) -> float:
         return self._fps

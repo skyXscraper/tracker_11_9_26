@@ -15,7 +15,7 @@ python run.py videos/cam0_test3.mp4                        # one recording
 python run.py videos/cam0_test3.mp4 videos/cam2_test3.mp4  # two recordings
 python run.py /dev/video0                                  # one live camera
 python run.py /dev/video0 /dev/video2 --no-display         # both, headless
-python -m pytest tests/ -q                                 # 86 tests
+python -m pytest tests/ -q                                 # 92 tests
 ```
 
 A source is a camera when it is a device index or `/dev/videoN`, an image when
@@ -236,6 +236,25 @@ ID that has settled is never swapped because a later frame read the lengths
 slightly differently. That rule exists because without it a single roll became
 three rows in the results (`ROLL-U5`, `ROLL-547`, `ROLL-U11`) as its reading
 drifted between frames.
+
+### A steady 15 fps
+
+`run.py` holds the loop to a fixed rate, 15 fps by default (`--fps`). Each
+iteration serves one tick: it takes the frame due at that moment — skipping
+frames in between on a recording, or taking the newest from a camera — and if a
+tick overruns, the next one jumps to whatever is due now rather than working
+through a backlog.
+
+Two things had to change for that to hold. OCR always runs on a background
+thread at a fixed rate; inline, a single 1–2 s read froze the whole loop. And
+the recorder writes exactly one frame per tick, repeating the last view for any
+tick that ran long, so `annotated.mp4` plays at true speed — it used to be
+hard-coded to 15 fps while writing every frame of 30 fps footage, which made
+recordings play at half speed.
+
+The header shows `target 15  late N` beside the measured rate. On the onsite
+clip it ran at 14.9 fps with one late tick over 45 seconds. `--fps 0` processes
+every frame as fast as possible with inline OCR, for repeatable tuning runs.
 
 ### Staying inside a 2 GB Pi
 

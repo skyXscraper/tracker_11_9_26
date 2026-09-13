@@ -78,6 +78,9 @@ def build_args() -> argparse.Namespace:
                         help="skip the annotated video (a little faster on the Pi)")
     parser.add_argument("--no-run-dir", action="store_true",
                         help="write straight into --output instead of a timestamped subfolder")
+    parser.add_argument("--fps", type=float, default=15.0,
+                        help="run at this steady frame rate (default 15); 0 processes "
+                             "every frame as fast as possible, for repeatable tuning runs")
     parser.add_argument("--realtime", action="store_true",
                         help="pace video files at their own frame rate")
     parser.add_argument("--max-seconds", type=float, help="stop after this long")
@@ -107,6 +110,8 @@ def main() -> int:
     if args.no_run_dir:
         cfg.output.per_run_dir = False
     cfg.output.dir = run_directory(cfg.output, args.sources)
+    if args.fps and args.fps > 0:
+        cfg.capture.fps = int(round(args.fps))     # ask the camera for the same rate
 
     names = args.names or ["cam1", "cam2"]
     if len(names) < len(args.sources):
@@ -132,33 +137,47 @@ def main() -> int:
     registry = RollRegistry(cfg.identity, frame_sizes)
     log = ResultLog(cfg.output)
 
+    files_only = all(hasattr(p.source, "fps") for p in pipelines.values())
+    paced = bool(args.fps and args.fps > 0)
     # Video files carry their own clock; live cameras use the wall clock.
-    offline = all(hasattr(p.source, "fps") for p in pipelines.values()) and not args.realtime
-    use_media_clock = offline
+    use_media_clock = files_only and not args.realtime
 
     engine = OcrEngine(cfg.ocr, cfg.detect, cfg.exposure)
-    # Offline: read every crop inline so a tuning run is complete and repeatable.
-    # Live: a background thread with a bounded queue, so a slow read never
-    # stalls capture and never grows memory behind a roll that has left.
-    worker = SyncOcrRunner(engine, cfg.ocr) if offline else OcrWorker(engine, cfg.ocr)
-    print("[init] ocr mode: {}".format("sync (offline)" if offline else "threaded (live)"))
+    # At a fixed frame rate OCR must never block the loop: a single read takes
+    # 1-2 s on a laptop CPU, and run inline it froze everything while it ran,
+    # which is what made the frame rate collapse. Only an unpaced run on files
+    # reads inline, so a tuning run stays complete and repeatable.
+    inline = files_only and not paced and not args.realtime
+    worker = SyncOcrRunner(engine, cfg.ocr) if inline else OcrWorker(engine, cfg.ocr)
+    print("[init] ocr mode: {}".format("inline (repeatable)" if inline else "background thread"))
+    print("[init] frame rate: {}".format(
+        f"steady {args.fps:g} fps" if paced else "every frame, as fast as possible"))
 
+    pacer = Pacer(args.fps) if paced else None
     writer = None
     meter = FpsMeter()
     started = time.time()
     finished = set()
     confirmed_count = 0
+    last_canvas = None
 
     print(f"[init] results -> {cfg.output.dir}"
           f"{'  (annotated video on)' if cfg.output.record else ''}")
     print("[run] press q in the window, or ctrl-c, to stop")
     try:
+        if pacer is not None:
+            pacer.begin()
         while len(finished) < len(pipelines):
+            # The tick this iteration serves. If the last one ran long, jump to
+            # the tick that is due now rather than working through a backlog.
+            tick = pacer.due_tick() if pacer is not None else None
+            media_t = tick * pacer.period if (pacer is not None and files_only) else None
+
             frames = {}
             for name, pipe in pipelines.items():
                 if name in finished:
                     continue
-                frame = pipe.read()
+                frame = pipe.read(media_t)
                 if frame is None:
                     if hasattr(pipe.source, "fps"):
                         finished.add(name)      # file exhausted
@@ -168,7 +187,16 @@ def main() -> int:
             if not frames:
                 if len(finished) >= len(pipelines):
                     break
-                time.sleep(0.005)
+                if pacer is not None:
+                    # A camera had nothing new this tick. Keep the recording on
+                    # time with the last view, and wait for the next slot rather
+                    # than spinning and counting every spin as a late tick.
+                    if cfg.output.record and writer is not None and last_canvas is not None:
+                        for _ in range(pacer.frames_owed(tick)):
+                            writer.write(last_canvas)
+                    pacer.wait_for_next(tick)
+                else:
+                    time.sleep(0.005)
                 continue
 
             now = (max(f.timestamp for f in frames.values())
@@ -195,18 +223,29 @@ def main() -> int:
 
             meter.tick()
             if cfg.output.display or cfg.output.record:
-                canvas = render(frames, pipelines, registry, cfg, worker, meter.value)
+                canvas = render(frames, pipelines, registry, cfg, worker, meter.value,
+                                pacer)
                 if canvas is not None:
+                    last_canvas = canvas
+                if last_canvas is not None:
                     if cfg.output.record:
-                        writer = ensure_writer(writer, canvas, cfg)
-                        writer.write(canvas)
+                        writer = ensure_writer(writer, last_canvas, cfg, args.fps, pipelines)
+                        # One frame per tick, repeating the latest view for any
+                        # tick that ran long, so the recording plays at true speed
+                        # -- previously 30 fps footage written at 15 fps played
+                        # back at half speed.
+                        repeats = pacer.frames_owed(tick) if pacer is not None else 1
+                        for _ in range(repeats):
+                            writer.write(last_canvas)
                     if cfg.output.display:
-                        cv2.imshow("rollocr - two cameras", canvas)
+                        cv2.imshow("rollocr", last_canvas)
                         if cv2.waitKey(1) & 0xFF == ord("q"):
                             break
 
             if args.max_seconds and (time.time() - started) > args.max_seconds:
                 break
+            if pacer is not None:
+                pacer.wait_for_next(tick)
     except KeyboardInterrupt:
         print("\n[run] interrupted")
     finally:
@@ -218,7 +257,12 @@ def main() -> int:
         cv2.destroyAllWindows()
         log.close()
 
-    summarise(registry, log, worker, started, confirmed_count)
+    pacer_summary = None
+    if pacer is not None:
+        ran = max(time.time() - started, 1e-6)
+        pacer_summary = (f"target {pacer.fps:g} fps, ran {meter.frames / ran:.1f} fps average, "
+                         f"{pacer.dropped} late tick(s) skipped")
+    summarise(registry, log, worker, started, confirmed_count, pacer_summary)
     return 0
 
 
@@ -333,6 +377,44 @@ def handle_ocr(worker, pipelines, registry, cfg, log, now, quiet: bool) -> int:
     return confirmed
 
 
+class Pacer:
+    """Holds the loop to a fixed frame rate.
+
+    Each iteration serves one tick. When processing a tick overruns its slot,
+    the next iteration jumps straight to the tick that is due, dropping the ones
+    in between: a live station needs the current frame, not a growing backlog.
+    """
+
+    def __init__(self, fps: float) -> None:
+        self.fps = float(fps)
+        self.period = 1.0 / self.fps
+        self._start = 0.0
+        self._written = 0          # recording frames emitted so far
+        self._last_tick = -1
+        self.dropped = 0
+
+    def begin(self) -> None:
+        self._start = time.perf_counter()
+
+    def due_tick(self) -> int:
+        due = int((time.perf_counter() - self._start) / self.period)
+        tick = max(due, self._last_tick + 1)
+        self.dropped += max(0, tick - self._last_tick - 1)
+        self._last_tick = tick
+        return tick
+
+    def frames_owed(self, tick: int) -> int:
+        """Recording frames needed to bring the video level with this tick."""
+        owed = max(1, tick + 1 - self._written)
+        self._written = tick + 1
+        return owed
+
+    def wait_for_next(self, tick: int) -> None:
+        delay = self._start + (tick + 1) * self.period - time.perf_counter()
+        if delay > 0:
+            time.sleep(delay)
+
+
 class FpsMeter:
     """Frame rate of the whole loop, averaged over a short sliding window.
 
@@ -346,9 +428,11 @@ class FpsMeter:
         self._count = 0
         self._since = time.time()
         self.value = 0.0
+        self.frames = 0
 
     def tick(self) -> float:
         self._count += 1
+        self.frames += 1
         elapsed = time.time() - self._since
         if elapsed >= self._window:
             self.value = self._count / elapsed
@@ -357,7 +441,7 @@ class FpsMeter:
         return self.value
 
 
-def render(frames, pipelines, registry, cfg, worker, pipeline_fps=0.0):
+def render(frames, pipelines, registry, cfg, worker, pipeline_fps=0.0, pacer=None):
     views = []
     for name, pipe in pipelines.items():
         frame = frames.get(name)
@@ -383,19 +467,26 @@ def render(frames, pipelines, registry, cfg, worker, pipeline_fps=0.0):
         canvas, pipeline_fps,
         {name: pipe.fps for name, pipe in pipelines.items()},
         {"rolls": sum(1 for r in registry.rolls.values() if not r.provisional),
-         "ocr": worker.processed, "dropped": worker.dropped},
+         "ocr": worker.processed, "dropped": worker.dropped,
+         "target": pacer.fps if pacer is not None else None,
+         "late": pacer.dropped if pacer is not None else 0},
     )
     return canvas
 
 
-def ensure_writer(writer, canvas, cfg):
+def ensure_writer(writer, canvas, cfg, fps=0.0, pipelines=None):
     if writer is not None:
         return writer
     Path(cfg.output.dir).mkdir(parents=True, exist_ok=True)
     path = f"{cfg.output.dir}/annotated.mp4"
     fourcc = cv2.VideoWriter_fourcc(*"mp4v")
-    writer = cv2.VideoWriter(path, fourcc, 15.0, (canvas.shape[1], canvas.shape[0]))
-    print(f"[run] recording annotated view to {path}")
+    # The rate the frames are actually produced at. Hard-coding 15 while writing
+    # every frame of a 30 fps source made recordings play at half speed.
+    if not fps or fps <= 0:
+        rates = [getattr(p.source, "fps", 0) for p in (pipelines or {}).values()]
+        fps = max([r for r in rates if r] or [15.0])
+    writer = cv2.VideoWriter(path, fourcc, float(fps), (canvas.shape[1], canvas.shape[0]))
+    print(f"[run] recording annotated view to {path} at {fps:g} fps")
     return writer
 
 
@@ -443,8 +534,10 @@ def describe(roll, camera: str | None = None) -> str:
         roll.confidence, where, tail)
 
 
-def summarise(registry, log, worker, started, confirmed_count) -> None:
+def summarise(registry, log, worker, started, confirmed_count, pacer_summary=None) -> None:
     elapsed = time.time() - started
+    if pacer_summary:
+        print(f"[done] {pacer_summary}")
     print(f"\n[done] {elapsed:.1f}s  ocr_calls={worker.processed}  "
           f"dropped={worker.dropped}")
     rolls = [r for r in registry.rolls.values() if not r.provisional]
